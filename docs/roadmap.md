@@ -39,6 +39,6 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 - ☑ Gemma 3 architecture (scaled embeddings, Q/K-norm, sandwich norms, GeGLU, NeoX RoPE) — verified on gemma-3-4b Q6_K vs llama.cpp
 - ☑ Qwen3 architecture (per-head Q/K-norm, NeoX RoPE, tied embeddings) — runs from SafeTensors
 - ◐ SafeTensors / Hugging Face loader — `WeightSource` trait unifies GGUF + SafeTensors; loads single-file and sharded BF16/F16/F32 models + `tokenizer.json`; runs Qwen3-4B end-to-end. PyTorch `.bin` loader still TODO
-- ☑ Apple MLX loader (4-bit group quant) + Qwen3-MoE (top-k router, stacked experts) — runs Qwen3-Coder-30B-A3B-MLX, validated token-for-token vs mlx_lm (CPU; GPU MoE next)
+- ☑ Apple MLX loader (4-bit group quant) + Qwen3-MoE (top-k router, stacked experts) — runs Qwen3-Coder-30B-A3B-MLX, validated token-for-token vs mlx_lm. GPU MoE (router top-k + expert dispatch in one command buffer): **22.7 tok/s** on M4 Max (vs 0.9 CPU)
 - ☐ Vulkan and CUDA backends
 - ☐ Data-driven (block-composed) model definitions

@@ -23,9 +23,14 @@ commands below rather than trusting the table blindly.
 | Llama-3.2-1B | Q4_K_M | ~0.8 GiB | — | **263 t/s** | — |
 | Qwen2.5-1.5B | Q4_K_M | ~1.0 GiB | — | **190 t/s** | — |
 | Qwen3-4B-Instruct | BF16 (HF) | ~8 GiB | ~1 t/s | **26.6 t/s** | n/a¹ |
+| Qwen3-Coder-30B-A3B | MLX 4-bit (MoE) | ~16 GiB | 0.9 t/s | **22.7 t/s** | n/a¹ |
 
-¹ BF16 SafeTensors is read directly (no GGUF conversion); llama.cpp can't load
-it without converting/quantizing first.
+¹ BF16 SafeTensors / MLX is read directly (no GGUF conversion); llama.cpp can't
+load it without converting/quantizing first.
+
+The 30B is a 128-expert top-8 mixture-of-experts: the whole token stays in one
+Metal command buffer (router top-k runs on the GPU), and the MLX 4-bit weights
+are kept resident and dequantized in-kernel.
 
 **gemma-3-4b Q6_K is at ~73% of llama.cpp** on the same file. The optimization
 path that got there (decode t/s): 2.7 (CPU) → 5.3 (naive 1-thread-per-row GPU)
