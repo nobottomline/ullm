@@ -5,6 +5,7 @@
 //! *how a model is executed*, so the rest of the engine never branches on file
 //! format.
 
+pub mod dequant;
 pub mod device;
 pub mod dtype;
 pub mod error;

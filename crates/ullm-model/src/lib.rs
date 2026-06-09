@@ -4,7 +4,7 @@
 //! readable numerical reference — the oracle the Metal backend will be validated
 //! against — not speed. Quantized weights, batching, and SIMD come later.
 
-use ullm_core::{DType, Error, Result};
+use ullm_core::{Error, Result};
 use ullm_gguf::GgufModel;
 
 /// Hyperparameters describing a Llama model.
@@ -234,25 +234,17 @@ impl LlamaModel {
     }
 }
 
-/// Read a tensor as a freshly-allocated `f32` vector (F32 source only).
+/// Load a tensor as a freshly-allocated `f32` vector, dequantizing as needed.
 fn tensor_f32(model: &GgufModel, name: &str) -> Result<Vec<f32>> {
     let info = model
         .tensors
         .get(name)
         .ok_or_else(|| Error::Format(format!("missing tensor '{name}'")))?;
-    if info.dtype != DType::F32 {
-        return Err(Error::Unsupported(format!(
-            "tensor '{name}' has dtype {:?}; only F32 is supported in Phase 0",
-            info.dtype
-        )));
-    }
+    let n: usize = info.shape.iter().product();
     let bytes = model
         .tensor_data(name)
         .ok_or_else(|| Error::Format(format!("no data for tensor '{name}'")))?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    ullm_core::dequant::dequantize(info.dtype, bytes, n)
 }
 
 /// `y[o] = sum_i w[o*in + i] * x[i]`, with `w` stored row-major as `[out, in]`.

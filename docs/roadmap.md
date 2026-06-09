@@ -18,6 +18,7 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 
 ## Phase 1 — Apple Silicon, fast
 
+- ☑ Quantized weight loading on CPU (F16/BF16, Q8_0, Q4_0/1, Q5_0/1, Q4_K/Q5_K/Q6_K) — runs real Q4_K_M models
 - ☐ Metal backend (matmul, attention/prefill, dequant kernels)
 - ☐ KV cache + sampler
 - ☐ OpenAI-compatible server, streaming
