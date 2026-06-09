@@ -13,7 +13,7 @@ mod weights;
 
 use ullm_core::{DType, Error, Result};
 use ullm_gguf::GgufModel;
-use ullm_metal::{GpuForward, GpuLayerInput, GpuModelInput, GpuParams, GpuWeight};
+use ullm_metal::{GpuExperts, GpuForward, GpuLayerInput, GpuModelInput, GpuParams, GpuWeight};
 use ullm_safetensors::SafeTensorsModel;
 
 pub use config::{Arch, LlamaConfig};
@@ -375,11 +375,6 @@ impl LlamaModel {
     }
 
     fn build_gpu(&self) -> Result<GpuForward> {
-        if self.layers.iter().any(|l| l.moe_gate.is_some()) {
-            return Err(Error::Unsupported(
-                "GPU forward does not support mixture-of-experts yet".into(),
-            ));
-        }
         let c = &self.config;
         let qk_norm = self.layers.first().is_some_and(|l| l.q_norm.is_some());
         let sandwich_norm = self.layers.first().is_some_and(|l| l.post_attn_norm.is_some());
@@ -398,6 +393,9 @@ impl LlamaModel {
             qk_norm,
             sandwich_norm,
             geglu: c.arch == Arch::Gemma3,
+            n_experts: c.n_experts,
+            n_experts_used: c.n_experts_used,
+            moe_inter: c.moe_inter,
         };
         fn gw(w: &QWeight) -> GpuWeight<'_> {
             GpuWeight {
@@ -405,6 +403,31 @@ impl LlamaModel {
                 bytes: &w.data,
                 out: w.out,
                 cols: w.cols,
+                mlx_scales: w.mlx.as_ref().map(|m| m.scales.as_slice()),
+                mlx_biases: w.mlx.as_ref().map(|m| m.biases.as_slice()),
+                mlx_group: w.mlx.as_ref().map_or(0, |m| m.group_size),
+            }
+        }
+        // Concatenate a layer's per-expert weights into one stacked upload.
+        fn experts(es: &[QWeight]) -> GpuExperts {
+            let mut bytes = Vec::new();
+            let mut scales = Vec::new();
+            let mut biases = Vec::new();
+            for e in es {
+                bytes.extend_from_slice(&e.data);
+                let m = e.mlx.as_ref().expect("MoE expert must be MLX-quantized");
+                scales.extend_from_slice(&m.scales);
+                biases.extend_from_slice(&m.biases);
+            }
+            let first = &es[0];
+            GpuExperts {
+                bytes,
+                scales,
+                biases,
+                n_experts: es.len(),
+                out: first.out,
+                cols: first.cols,
+                group: first.mlx.as_ref().map_or(64, |m| m.group_size),
             }
         }
         let layers = self
@@ -427,6 +450,10 @@ impl LlamaModel {
                 w_gate: gw(&l.w_gate),
                 w_up: gw(&l.w_up),
                 w_down: gw(&l.w_down),
+                moe_gate: l.moe_gate.as_ref().map(gw),
+                experts_gate: (!l.experts_gate.is_empty()).then(|| experts(&l.experts_gate)),
+                experts_up: (!l.experts_up.is_empty()).then(|| experts(&l.experts_up)),
+                experts_down: (!l.experts_down.is_empty()).then(|| experts(&l.experts_down)),
             })
             .collect();
         let input = GpuModelInput {

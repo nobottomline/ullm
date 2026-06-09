@@ -10,7 +10,7 @@ use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptio
 use ullm_core::{DType, Error, Result};
 
 mod forward;
-pub use forward::{GpuForward, GpuLayerInput, GpuModelInput, GpuParams, GpuWeight};
+pub use forward::{GpuExperts, GpuForward, GpuLayerInput, GpuModelInput, GpuParams, GpuWeight};
 
 pub(crate) const SHADER: &str = r#"
 #include <metal_stdlib>
@@ -398,6 +398,88 @@ kernel void matvec_mlx4(
     }
     acc = simd_sum(acc);
     if (lane == 0 && o < out_dim) y[o] = acc;
+}
+
+// Top-k expert selection + renormalized softmax over the selected logits.
+// Router widths are tiny (e.g. 128), so a single thread suffices.
+kernel void moe_topk(
+    device const float* logits [[buffer(0)]],
+    device uint*        idx    [[buffer(1)]],
+    device float*       wts    [[buffer(2)]],
+    constant uint&      n      [[buffer(3)]],
+    constant uint&      kk     [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0u) return;
+    const uint KMAX = 16u;
+    uint k = min(kk, KMAX);
+    float best[KMAX];
+    uint  bidx[KMAX];
+    for (uint j = 0; j < k; ++j) { best[j] = -INFINITY; bidx[j] = 0u; }
+    for (uint i = 0; i < n; ++i) {
+        float v = logits[i];
+        if (v > best[k - 1u]) {
+            uint j = k - 1u;
+            while (j > 0u && v > best[j - 1u]) {
+                best[j] = best[j - 1u]; bidx[j] = bidx[j - 1u]; --j;
+            }
+            best[j] = v; bidx[j] = i;
+        }
+    }
+    float mx = best[0];
+    float sum = 0.0f;
+    for (uint j = 0; j < k; ++j) { float e = exp(best[j] - mx); wts[j] = e; sum += e; }
+    float inv = 1.0f / sum;
+    for (uint j = 0; j < k; ++j) { wts[j] *= inv; idx[j] = bidx[j]; }
+}
+
+// Expert-indexed MLX 4-bit matvec over stacked expert weights: computes
+// y = W[eidx[slot]] · x. mode 0 writes y, mode 1 writes wts[slot]*dot (first
+// expert of the accumulation), mode 2 adds wts[slot]*dot. Encoder serialization
+// makes the sequential per-slot accumulation safe.
+kernel void matvec_mlx4_id(
+    device const uint*  w          [[buffer(0)]],
+    device const float* x          [[buffer(1)]],
+    device float*       y          [[buffer(2)]],
+    device const float* scales     [[buffer(3)]],
+    device const float* biases     [[buffer(4)]],
+    constant uint&      in_dim     [[buffer(5)]],
+    constant uint&      out_dim    [[buffer(6)]],
+    constant uint&      group_size [[buffer(7)]],
+    device const uint*  eidx       [[buffer(8)]],
+    device const float* ewts       [[buffer(9)]],
+    constant uint&      slot       [[buffer(10)]],
+    constant uint&      mode       [[buffer(11)]],
+    uint   tg   [[threadgroup_position_in_grid]],
+    ushort sgi  [[simdgroup_index_in_threadgroup]],
+    ushort sgs  [[simdgroups_per_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    uint o = (uint)tg * sgs + sgi;
+    uint e = eidx[slot];
+    uint words  = in_dim / 8u;
+    uint groups = in_dim / group_size;
+    device const uint*  we = w      + (ulong)e * out_dim * words;
+    device const float* se = scales + (ulong)e * out_dim * groups;
+    device const float* be = biases + (ulong)e * out_dim * groups;
+    float acc = 0.0f;
+    if (o < out_dim) {
+        device const uint*  row  = we + o * words;
+        device const float* srow = se + o * groups;
+        device const float* brow = be + o * groups;
+        for (uint i = lane; i < in_dim; i += 32u) {
+            uint word = row[i / 8u];
+            uint q = (word >> ((i % 8u) * 4u)) & 0xFu;
+            uint g = i / group_size;
+            acc += ((float)q * srow[g] + brow[g]) * x[i];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0 && o < out_dim) {
+        if (mode == 0u)      y[o] = acc;
+        else if (mode == 1u) y[o] = ewts[slot] * acc;
+        else                 y[o] += ewts[slot] * acc;
+    }
 }
 
 // Multi-row BF16 matvec (for SafeTensors / HF weights). bf16 is the top 16 bits

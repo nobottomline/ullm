@@ -40,14 +40,36 @@ pub struct GpuParams {
     pub sandwich_norm: bool,
     /// GeGLU feed-forward when true, SwiGLU otherwise.
     pub geglu: bool,
+    /// Mixture-of-experts: number of experts (0 = dense FFN).
+    pub n_experts: usize,
+    /// Experts selected per token (top-k routing).
+    pub n_experts_used: usize,
+    /// Per-expert feed-forward width.
+    pub moe_inter: usize,
 }
 
 /// A weight matrix to upload: raw (possibly quantized) bytes plus its shape.
+/// For MLX 4-bit weights, `mlx_scales`/`mlx_biases` (the per-group tables) are
+/// also given and `dtype` is `U32`.
 pub struct GpuWeight<'a> {
     pub dtype: DType,
     pub bytes: &'a [u8],
     pub out: usize,
     pub cols: usize,
+    pub mlx_scales: Option<&'a [f32]>,
+    pub mlx_biases: Option<&'a [f32]>,
+    pub mlx_group: usize,
+}
+
+/// Stacked per-expert MLX 4-bit weights (`n_experts` matrices concatenated).
+pub struct GpuExperts {
+    pub bytes: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub biases: Vec<f32>,
+    pub n_experts: usize,
+    pub out: usize,
+    pub cols: usize,
+    pub group: usize,
 }
 
 /// Per-layer weights handed to the GPU loader (norms as f32, projections raw).
@@ -68,6 +90,11 @@ pub struct GpuLayerInput<'a> {
     pub w_gate: GpuWeight<'a>,
     pub w_up: GpuWeight<'a>,
     pub w_down: GpuWeight<'a>,
+    /// MoE router + stacked experts (set on MoE layers; dense `w_*` then unused).
+    pub moe_gate: Option<GpuWeight<'a>>,
+    pub experts_gate: Option<GpuExperts>,
+    pub experts_up: Option<GpuExperts>,
+    pub experts_down: Option<GpuExperts>,
 }
 
 /// The whole model handed to the GPU loader. The input embedding is looked up
@@ -80,12 +107,30 @@ pub struct GpuModelInput<'a> {
     pub layers: Vec<GpuLayerInput<'a>>,
 }
 
+/// The per-group scale/bias buffers for a resident MLX 4-bit weight.
+struct MlxBufs {
+    scales: Buffer,
+    biases: Buffer,
+    group: u32,
+}
+
 /// A resident weight matrix on the GPU.
 struct WBuf {
     buf: Buffer,
     dtype: DType,
     out: usize,
     cols: usize,
+    mlx: Option<MlxBufs>,
+}
+
+/// Stacked per-expert MLX 4-bit weights resident on the GPU.
+struct EBuf {
+    buf: Buffer,
+    scales: Buffer,
+    biases: Buffer,
+    out: usize,
+    cols: usize,
+    group: u32,
 }
 
 struct GpuLayer {
@@ -105,6 +150,10 @@ struct GpuLayer {
     w_gate: WBuf,
     w_up: WBuf,
     w_down: WBuf,
+    moe_gate: Option<WBuf>,
+    experts_gate: Option<EBuf>,
+    experts_up: Option<EBuf>,
+    experts_down: Option<EBuf>,
 }
 
 /// A model resident on the GPU, ready to decode tokens.
@@ -126,6 +175,9 @@ pub struct GpuForward {
     p_silu_mul: ComputePipelineState,
     p_gelu_mul: ComputePipelineState,
     p_add: ComputePipelineState,
+    p_matvec_mlx4: ComputePipelineState,
+    p_matvec_mlx4_id: ComputePipelineState,
+    p_moe_topk: ComputePipelineState,
     // config
     p: GpuParams,
     // weights
@@ -145,6 +197,10 @@ pub struct GpuForward {
     logits: Buffer,
     key_cache: Buffer,
     val_cache: Buffer,
+    // MoE scratch (allocated even for dense models; tiny)
+    moe_logits: Buffer,
+    moe_idx: Buffer,
+    moe_wts: Buffer,
 }
 
 // SAFETY: the Metal handles are only ever touched while decoding a single token,
@@ -155,6 +211,7 @@ unsafe impl Send for GpuForward {}
 
 impl GpuForward {
     /// Upload a model to the GPU and compile the forward kernels.
+    #[allow(clippy::redundant_closure)] // upload closures are reused, can't be moved
     pub fn new(input: &GpuModelInput) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| Error::Unsupported("no Metal device available".into()))?;
@@ -184,6 +241,24 @@ impl GpuForward {
                 dtype: w.dtype,
                 out: w.out,
                 cols: w.cols,
+                mlx: match (w.mlx_scales, w.mlx_biases) {
+                    (Some(s), Some(b)) => Some(MlxBufs {
+                        scales: upload_f32(s),
+                        biases: upload_f32(b),
+                        group: w.mlx_group as u32,
+                    }),
+                    _ => None,
+                },
+            }
+        };
+        let ebuf = |e: &GpuExperts| -> EBuf {
+            EBuf {
+                buf: upload_bytes(&e.bytes),
+                scales: upload_f32(&e.scales),
+                biases: upload_f32(&e.biases),
+                out: e.out,
+                cols: e.cols,
+                group: e.group as u32,
             }
         };
         let opt = |o: Option<&[f32]>| o.map(upload_f32);
@@ -208,11 +283,16 @@ impl GpuForward {
                 w_gate: wbuf(&l.w_gate),
                 w_up: wbuf(&l.w_up),
                 w_down: wbuf(&l.w_down),
+                moe_gate: l.moe_gate.as_ref().map(|w| wbuf(w)),
+                experts_gate: l.experts_gate.as_ref().map(|e| ebuf(e)),
+                experts_up: l.experts_up.as_ref().map(|e| ebuf(e)),
+                experts_down: l.experts_down.as_ref().map(|e| ebuf(e)),
             })
             .collect();
 
         let kv_dim = p.n_kv_head * p.head_dim;
         let q_dim = p.n_head * p.head_dim;
+        let ffn_dim = p.n_ff.max(p.moe_inter).max(1);
         let alloc = |n: usize| device.new_buffer((n * 4) as u64, SHARED);
 
         Ok(Self {
@@ -231,6 +311,9 @@ impl GpuForward {
             p_silu_mul: pso("silu_mul")?,
             p_gelu_mul: pso("gelu_mul")?,
             p_add: pso("add_inplace")?,
+            p_matvec_mlx4: pso("matvec_mlx4")?,
+            p_matvec_mlx4_id: pso("matvec_mlx4_id")?,
+            p_moe_topk: pso("moe_topk")?,
             output: wbuf(&input.output),
             final_norm: upload_f32(input.final_norm),
             layers,
@@ -239,13 +322,16 @@ impl GpuForward {
             xb2: alloc(p.n_embd),
             q: alloc(q_dim),
             attn: alloc(q_dim),
-            gate: alloc(p.n_ff),
-            up: alloc(p.n_ff),
-            hidden: alloc(p.n_ff),
+            gate: alloc(ffn_dim),
+            up: alloc(ffn_dim),
+            hidden: alloc(ffn_dim),
             scores: alloc(p.n_head * p.n_ctx),
             logits: alloc(p.vocab),
             key_cache: alloc(p.n_layer * p.n_ctx * kv_dim),
             val_cache: alloc(p.n_layer * p.n_ctx * kv_dim),
+            moe_logits: alloc(p.n_experts.max(1)),
+            moe_idx: alloc(p.n_experts_used.max(1)),
+            moe_wts: alloc(p.n_experts_used.max(1)),
             queue,
             p,
         })
@@ -339,13 +425,29 @@ impl GpuForward {
             }
             self.add(enc, &self.x, &self.xb, p.n_embd);
 
-            // feed-forward
+            // feed-forward: dense SwiGLU/GeGLU, or mixture-of-experts
             self.rmsnorm(enc, &self.x, 0, &lw.ffn_norm, &self.xb, 0, p.n_embd);
-            self.matvec(enc, &lw.w_gate, &self.xb, &self.gate, 0);
-            self.matvec(enc, &lw.w_up, &self.xb, &self.up, 0);
             let ffn_pso = if p.geglu { &self.p_gelu_mul } else { &self.p_silu_mul };
-            self.glu(enc, ffn_pso, p.n_ff);
-            self.matvec(enc, &lw.w_down, &self.hidden, &self.xb2, 0);
+            if let Some(gate_w) = &lw.moe_gate {
+                // router logits -> top-k -> weighted sum of selected experts in xb2
+                self.matvec(enc, gate_w, &self.xb, &self.moe_logits, 0);
+                self.moe_topk(enc);
+                let eg = lw.experts_gate.as_ref().unwrap();
+                let eu = lw.experts_up.as_ref().unwrap();
+                let ed = lw.experts_down.as_ref().unwrap();
+                for slot in 0..p.n_experts_used as u32 {
+                    self.matvec_id(enc, eg, &self.xb, &self.gate, slot, 0);
+                    self.matvec_id(enc, eu, &self.xb, &self.up, slot, 0);
+                    self.glu(enc, ffn_pso, p.moe_inter);
+                    let mode = if slot == 0 { 1 } else { 2 };
+                    self.matvec_id(enc, ed, &self.hidden, &self.xb2, slot, mode);
+                }
+            } else {
+                self.matvec(enc, &lw.w_gate, &self.xb, &self.gate, 0);
+                self.matvec(enc, &lw.w_up, &self.xb, &self.up, 0);
+                self.glu(enc, ffn_pso, p.n_ff);
+                self.matvec(enc, &lw.w_down, &self.hidden, &self.xb2, 0);
+            }
             if p.sandwich_norm {
                 if let Some(w) = &lw.post_ffn_norm {
                     self.rmsnorm(enc, &self.xb2, 0, w, &self.xb2, 0, p.n_embd);
@@ -459,13 +561,27 @@ impl GpuForward {
     // ---- op encoders (each appends one dispatch to `enc`) ----
 
     fn matvec(&self, enc: &ComputeCommandEncoderRef, w: &WBuf, x: &Buffer, y: &Buffer, y_off: u64) {
+        let (in_dim, out_dim) = (w.cols as u32, w.out as u32);
+        if let Some(m) = &w.mlx {
+            enc.set_compute_pipeline_state(&self.p_matvec_mlx4);
+            enc.set_buffer(0, Some(&w.buf), 0);
+            enc.set_buffer(1, Some(x), 0);
+            enc.set_buffer(2, Some(y), y_off);
+            enc.set_buffer(3, Some(&m.scales), 0);
+            enc.set_buffer(4, Some(&m.biases), 0);
+            enc.set_bytes(5, 4, (&in_dim as *const u32).cast());
+            enc.set_bytes(6, 4, (&out_dim as *const u32).cast());
+            enc.set_bytes(7, 4, (&m.group as *const u32).cast());
+            const THREADS: u64 = 256;
+            let groups = (w.out as u64).div_ceil(THREADS / 32);
+            enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
+            return;
+        }
         let pso = self.pso_matvec(w.dtype).expect("matvec dtype");
         enc.set_compute_pipeline_state(pso);
         enc.set_buffer(0, Some(&w.buf), 0);
         enc.set_buffer(1, Some(x), 0);
         enc.set_buffer(2, Some(y), y_off);
-        let in_dim = w.cols as u32;
-        let out_dim = w.out as u32;
         enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
         enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
         // 8 simdgroups per threadgroup; the Q6_K kernel computes NR0=4 rows per
@@ -478,6 +594,50 @@ impl GpuForward {
         };
         let groups = (w.out as u64).div_ceil(sgs * nr0);
         enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
+    /// Expert-indexed MLX 4-bit matvec: `y = ewts[slot]^? * (W[idx[slot]] · x)`,
+    /// `mode` controls write/init-accumulate/accumulate (see the kernel).
+    #[allow(clippy::too_many_arguments)]
+    fn matvec_id(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        e: &EBuf,
+        x: &Buffer,
+        y: &Buffer,
+        slot: u32,
+        mode: u32,
+    ) {
+        enc.set_compute_pipeline_state(&self.p_matvec_mlx4_id);
+        enc.set_buffer(0, Some(&e.buf), 0);
+        enc.set_buffer(1, Some(x), 0);
+        enc.set_buffer(2, Some(y), 0);
+        enc.set_buffer(3, Some(&e.scales), 0);
+        enc.set_buffer(4, Some(&e.biases), 0);
+        let (in_dim, out_dim) = (e.cols as u32, e.out as u32);
+        enc.set_bytes(5, 4, (&in_dim as *const u32).cast());
+        enc.set_bytes(6, 4, (&out_dim as *const u32).cast());
+        enc.set_bytes(7, 4, (&e.group as *const u32).cast());
+        enc.set_buffer(8, Some(&self.moe_idx), 0);
+        enc.set_buffer(9, Some(&self.moe_wts), 0);
+        enc.set_bytes(10, 4, (&slot as *const u32).cast());
+        enc.set_bytes(11, 4, (&mode as *const u32).cast());
+        const THREADS: u64 = 256;
+        let groups = (e.out as u64).div_ceil(THREADS / 32);
+        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
+    /// Router top-k + softmax: fills `moe_idx`/`moe_wts` from `moe_logits`.
+    fn moe_topk(&self, enc: &ComputeCommandEncoderRef) {
+        enc.set_compute_pipeline_state(&self.p_moe_topk);
+        enc.set_buffer(0, Some(&self.moe_logits), 0);
+        enc.set_buffer(1, Some(&self.moe_idx), 0);
+        enc.set_buffer(2, Some(&self.moe_wts), 0);
+        let n = self.p.n_experts as u32;
+        let k = self.p.n_experts_used as u32;
+        enc.set_bytes(3, 4, (&n as *const u32).cast());
+        enc.set_bytes(4, 4, (&k as *const u32).cast());
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
     }
 
     #[allow(clippy::too_many_arguments)]
