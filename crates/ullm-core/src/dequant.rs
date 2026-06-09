@@ -281,9 +281,57 @@ fn q6_k(data: &[u8], nblocks: usize, out: &mut [f32]) {
     }
 }
 
+/// Convert a bfloat16 value (top 16 bits of an f32) to `f32`.
+#[inline]
+pub fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+/// Dequantize MLX 4-bit group-quantized weights to `f32`.
+///
+/// MLX stores a quantized linear as three tensors: `weight` packs eight 4-bit
+/// values per `u32` (least-significant nibble first), and each group of
+/// `group_size` weights shares one `scale` and `bias`. The dequantized value is
+/// `q * scale + bias`. `weight` is row-major `[out, in/8]`; `scales`/`biases`
+/// are `[out, in/group_size]`.
+pub fn dequantize_mlx_q4(
+    weight: &[u32],
+    scales: &[f32],
+    biases: &[f32],
+    out: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> Vec<f32> {
+    let words = in_dim / 8;
+    let groups = in_dim / group_size;
+    let mut y = vec![0.0f32; out * in_dim];
+    for o in 0..out {
+        for i in 0..in_dim {
+            let word = weight[o * words + i / 8];
+            let q = (word >> ((i % 8) * 4)) & 0xF;
+            let g = o * groups + i / group_size;
+            y[o * in_dim + i] = q as f32 * scales[g] + biases[g];
+        }
+    }
+    y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mlx_q4_matches_reference() {
+        // Captured from mlx.dequantize on Qwen3-Coder-30B-MLX-4bit, k_proj row 0.
+        let w = [2569837433u32];
+        let s = [0.004_425_049_f32];
+        let b = [-0.039_794_922_f32];
+        let y = dequantize_mlx_q4(&w, &s, &b, 1, 8, 64);
+        let expect = [3e-5, -0.00882, 0.00888, 3e-5, 0.01331, -0.03094, 3e-5, 3e-5];
+        for (a, e) in y.iter().zip(&expect) {
+            assert!((a - e).abs() < 1e-4, "{a} vs {e}");
+        }
+    }
 
     #[test]
     fn f16_roundtrips_simple_values() {
