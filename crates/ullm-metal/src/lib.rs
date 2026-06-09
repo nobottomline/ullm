@@ -385,15 +385,21 @@ kernel void matvec_mlx4(
     float acc = 0.0f;
     if (o < out_dim) {
         uint words  = in_dim / 8u;
-        uint groups = in_dim / group_size;
+        uint wpg    = group_size / 8u;          // words per scale/bias group
         device const uint*  row  = w + o * words;
-        device const float* srow = scales + o * groups;
-        device const float* brow = biases + o * groups;
-        for (uint i = lane; i < in_dim; i += 32u) {
-            uint word = row[i / 8u];
-            uint q = (word >> ((i % 8u) * 4u)) & 0xFu;
-            uint g = i / group_size;
-            acc += ((float)q * srow[g] + brow[g]) * x[i];
+        device const float* srow = scales + o * (in_dim / group_size);
+        device const float* brow = biases + o * (in_dim / group_size);
+        // Each lane consumes whole u32 words (8 nibbles), so the word and its
+        // group scale/bias load once and feed 8 multiply-adds.
+        for (uint wi = lane; wi < words; wi += 32u) {
+            uint word = row[wi];
+            uint g = wi / wpg;
+            float sc = srow[g], bi = brow[g];
+            device const float* xb = x + wi * 8u;
+            for (uint n = 0; n < 8u; ++n) {
+                uint q = (word >> (n * 4u)) & 0xFu;
+                acc += ((float)q * sc + bi) * xb[n];
+            }
         }
     }
     acc = simd_sum(acc);
@@ -567,7 +573,7 @@ kernel void moe_gate_up_all(
     if (o >= out_dim) return;
     uint slot = tgpig.y;
     uint e = eidx[slot];
-    uint words = in_dim / 8u, groups = in_dim / group_size;
+    uint words = in_dim / 8u, groups = in_dim / group_size, wpg = group_size / 8u;
     ulong base = ((ulong)e * out_dim + o);
     device const uint*  rg  = wg + base * words;
     device const uint*  ru  = wu + base * words;
@@ -576,11 +582,15 @@ kernel void moe_gate_up_all(
     device const float* sur = su + base * groups;
     device const float* bur = bu + base * groups;
     float ag = 0.0f, au = 0.0f;
-    for (uint i = lane; i < in_dim; i += 32u) {
-        uint gi = i / group_size, sh = (i % 8u) * 4u;
-        float xi = x[i];
-        ag += ((float)((rg[i / 8u] >> sh) & 0xFu) * sgr[gi] + bgr[gi]) * xi;
-        au += ((float)((ru[i / 8u] >> sh) & 0xFu) * sur[gi] + bur[gi]) * xi;
+    for (uint wi = lane; wi < words; wi += 32u) {
+        uint gw = rg[wi], uw = ru[wi], g = wi / wpg;
+        float sgv = sgr[g], bgv = bgr[g], suv = sur[g], buv = bur[g];
+        device const float* xb = x + wi * 8u;
+        for (uint n = 0; n < 8u; ++n) {
+            float xi = xb[n];
+            ag += ((float)((gw >> (n * 4u)) & 0xFu) * sgv + bgv) * xi;
+            au += ((float)((uw >> (n * 4u)) & 0xFu) * suv + buv) * xi;
+        }
     }
     ag = simd_sum(ag);
     au = simd_sum(au);
@@ -618,17 +628,20 @@ kernel void moe_down_all(
     if (o >= out_dim) return;
     uint slot = tgpig.y;
     uint e = eidx[slot];
-    uint words = in_dim / 8u, groups = in_dim / group_size;
+    uint words = in_dim / 8u, groups = in_dim / group_size, wpg = group_size / 8u;
     ulong base = ((ulong)e * out_dim + o);
     device const uint*  row  = wd + base * words;
     device const float* srow = sd + base * groups;
     device const float* brow = bd + base * groups;
     device const float* h    = hidden + (ulong)slot * in_dim;
     float acc = 0.0f;
-    for (uint i = lane; i < in_dim; i += 32u) {
-        uint gi = i / group_size;
-        uint q = (row[i / 8u] >> ((i % 8u) * 4u)) & 0xFu;
-        acc += ((float)q * srow[gi] + brow[gi]) * h[i];
+    for (uint wi = lane; wi < words; wi += 32u) {
+        uint word = row[wi], g = wi / wpg;
+        float sc = srow[g], bi = brow[g];
+        device const float* hb = h + wi * 8u;
+        for (uint n = 0; n < 8u; ++n) {
+            acc += ((float)((word >> (n * 4u)) & 0xFu) * sc + bi) * hb[n];
+        }
     }
     acc = simd_sum(acc);
     if (lane == 0) out[(ulong)slot * out_dim + o] = acc;
