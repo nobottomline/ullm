@@ -48,6 +48,13 @@ pub(crate) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// Add a bias vector elementwise: `x[i] += b[i]`.
+pub(crate) fn add_bias(x: &mut [f32], b: &[f32]) {
+    for (xi, bi) in x.iter_mut().zip(b) {
+        *xi += bi;
+    }
+}
+
 /// Rotary position embedding (interleaved / ggml "NORM" convention), applied to
 /// each head independently in place.
 pub(crate) fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {

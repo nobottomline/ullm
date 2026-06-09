@@ -35,6 +35,7 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 ## Phase 3 — Broaden
 
 - ☑ Byte-level BPE tokenizer — runs the Llama-3 / GPT-2 / Qwen family (verified on Llama-3.2-1B)
+- ☑ Qwen2 architecture (Q/K/V attention bias) — verified on Qwen2.5-1.5B-Instruct
 - ☐ SafeTensors + PyTorch loaders
 - ☐ Vulkan and CUDA backends
 - ☐ Data-driven (block-composed) model definitions

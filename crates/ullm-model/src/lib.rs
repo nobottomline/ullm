@@ -16,7 +16,7 @@ use ullm_gguf::GgufModel;
 pub use config::LlamaConfig;
 pub use sample::SampleParams;
 
-use math::{matvec_q, rmsnorm, rope, silu, softmax};
+use math::{add_bias, matvec_q, rmsnorm, rope, silu, softmax};
 use sample::sample_token;
 use weights::{qweight, tensor_f32};
 
@@ -36,13 +36,17 @@ impl QWeight {
     }
 }
 
-/// Per-layer weights: norms in f32 (tiny), projections kept quantized.
+/// Per-layer weights: norms in f32 (tiny), projections kept quantized. Q/K/V
+/// biases are present on some architectures (e.g. Qwen2).
 struct LayerWeights {
     attn_norm: Vec<f32>,
     wq: QWeight,
     wk: QWeight,
     wv: QWeight,
     wo: QWeight,
+    q_bias: Option<Vec<f32>>,
+    k_bias: Option<Vec<f32>>,
+    v_bias: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
     w_gate: QWeight,
     w_up: QWeight,
@@ -63,33 +67,43 @@ pub struct LlamaModel {
 impl LlamaModel {
     /// Load a Llama model from a parsed GGUF file (any supported quantization).
     pub fn from_gguf(model: &GgufModel) -> Result<Self> {
-        let arch = model.architecture().unwrap_or_default();
-        if arch != "llama" {
+        let arch = model.architecture().unwrap_or_default().to_string();
+        if arch != "llama" && arch != "qwen2" {
             return Err(Error::Unsupported(format!(
-                "architecture '{arch}' is not supported yet (Phase 0 is llama-only)"
+                "architecture '{arch}' is not supported yet (llama and qwen2)"
             )));
         }
 
-        let req_u = |key: &str| -> Result<u64> {
+        // Metadata keys are namespaced by architecture, e.g. `llama.block_count`.
+        let req_u = |suffix: &str| -> Result<u64> {
+            let k = format!("{arch}.{suffix}");
             model
-                .metadata_get(key)
+                .metadata_get(&k)
                 .and_then(|v| v.to_u64())
-                .ok_or_else(|| Error::Format(format!("missing metadata '{key}'")))
+                .ok_or_else(|| Error::Format(format!("missing metadata '{k}'")))
         };
-        let opt_u = |key: &str| model.metadata_get(key).and_then(|v| v.to_u64());
-        let opt_f = |key: &str| model.metadata_get(key).and_then(|v| v.to_f32());
+        let opt_u = |suffix: &str| {
+            model
+                .metadata_get(&format!("{arch}.{suffix}"))
+                .and_then(|v| v.to_u64())
+        };
+        let opt_f = |suffix: &str| {
+            model
+                .metadata_get(&format!("{arch}.{suffix}"))
+                .and_then(|v| v.to_f32())
+        };
 
-        let n_embd = req_u("llama.embedding_length")? as usize;
-        let n_head = req_u("llama.attention.head_count")? as usize;
-        let n_layer = req_u("llama.block_count")? as usize;
-        let n_kv_head = opt_u("llama.attention.head_count_kv").unwrap_or(n_head as u64) as usize;
-        let n_ff = req_u("llama.feed_forward_length")? as usize;
-        let n_ctx = opt_u("llama.context_length").unwrap_or(2048) as usize;
-        let head_dim = opt_u("llama.attention.key_length")
+        let n_embd = req_u("embedding_length")? as usize;
+        let n_head = req_u("attention.head_count")? as usize;
+        let n_layer = req_u("block_count")? as usize;
+        let n_kv_head = opt_u("attention.head_count_kv").unwrap_or(n_head as u64) as usize;
+        let n_ff = req_u("feed_forward_length")? as usize;
+        let n_ctx = opt_u("context_length").unwrap_or(2048) as usize;
+        let head_dim = opt_u("attention.key_length")
             .map(|v| v as usize)
             .unwrap_or(n_embd / n_head);
-        let rope_theta = opt_f("llama.rope.freq_base").unwrap_or(10000.0);
-        let eps = opt_f("llama.attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
+        let rope_theta = opt_f("rope.freq_base").unwrap_or(10000.0);
+        let eps = opt_f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let vocab_size = model.model_spec().vocab_size as usize;
 
         let config = LlamaConfig {
@@ -114,6 +128,9 @@ impl LlamaModel {
                 wk: qweight(model, &format!("blk.{i}.attn_k.weight"))?,
                 wv: qweight(model, &format!("blk.{i}.attn_v.weight"))?,
                 wo: qweight(model, &format!("blk.{i}.attn_output.weight"))?,
+                q_bias: tensor_f32(model, &format!("blk.{i}.attn_q.bias")).ok(),
+                k_bias: tensor_f32(model, &format!("blk.{i}.attn_k.bias")).ok(),
+                v_bias: tensor_f32(model, &format!("blk.{i}.attn_v.bias")).ok(),
                 ffn_norm: tensor_f32(model, &format!("blk.{i}.ffn_norm.weight"))?,
                 w_gate: qweight(model, &format!("blk.{i}.ffn_gate.weight"))?,
                 w_up: qweight(model, &format!("blk.{i}.ffn_up.weight"))?,
@@ -170,7 +187,16 @@ impl LlamaModel {
             let xb = rmsnorm(&x, &lw.attn_norm, eps);
             let mut q = matvec_q(&lw.wq, &xb);
             let mut k = matvec_q(&lw.wk, &xb);
-            let v = matvec_q(&lw.wv, &xb);
+            let mut v = matvec_q(&lw.wv, &xb);
+            if let Some(b) = &lw.q_bias {
+                add_bias(&mut q, b);
+            }
+            if let Some(b) = &lw.k_bias {
+                add_bias(&mut k, b);
+            }
+            if let Some(b) = &lw.v_bias {
+                add_bias(&mut v, b);
+            }
             rope(&mut q, n_head, head_dim, pos, rope_theta);
             rope(&mut k, c.n_kv_head, head_dim, pos, rope_theta);
 
