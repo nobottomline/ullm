@@ -258,6 +258,7 @@ fn metal_check() {
     if !ok {
         std::process::exit(1);
     }
+    bench_gemv(&ctx, 5632, 2048);
 }
 
 fn cpu_ref(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
@@ -319,4 +320,65 @@ fn check_quant(
             false
         }
     }
+}
+
+/// Compare GPU (quantized, resident) vs GPU/CPU f32 throughput on one GEMV.
+fn bench_gemv(ctx: &MetalContext, o: usize, i: usize) {
+    use rayon::prelude::*;
+
+    let ts = 144usize;
+    let total = o * (i / 256) * ts;
+    let half = 0x3000u16.to_le_bytes();
+    let mut wq: Vec<u8> = (0..total)
+        .map(|k| (k.wrapping_mul(131).wrapping_add(7) % 251) as u8)
+        .collect();
+    for blk in wq.chunks_mut(ts) {
+        blk[0] = half[0];
+        blk[1] = half[1];
+        blk[2] = half[0];
+        blk[3] = half[1];
+    }
+    let wf = ullm_core::dequant::dequantize(ullm_core::DType::Q4K, &wq, o * i).expect("dequant");
+    let x: Vec<f32> = (0..i).map(|k| ((k % 13) as f32 - 6.0) * 0.1).collect();
+    let wbuf = ctx.upload(&wq);
+    let n = 200;
+
+    let _ = ctx.matvec_resident(ullm_core::DType::Q4K, &wbuf, &x, o, i); // warm up
+    let gpu_q4k = time_ms(n, || {
+        let _ = ctx.matvec_resident(ullm_core::DType::Q4K, &wbuf, &x, o, i);
+    });
+    let gpu_f32 = time_ms(n, || {
+        let _ = ctx.matvec(&wf, &x, o, i);
+    });
+    let cpu_f32 = time_ms(n, || {
+        let _: Vec<f32> = (0..o)
+            .into_par_iter()
+            .map(|r| {
+                wf[r * i..r * i + i]
+                    .iter()
+                    .zip(&x)
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect();
+    });
+
+    println!();
+    println!("throughput  {o}x{i} GEMV (avg of {n} ops):");
+    println!("  GPU Q4_K (resident):  {gpu_q4k:.3} ms");
+    println!("  GPU f32:              {gpu_f32:.3} ms");
+    println!("  CPU f32 (rayon):      {cpu_f32:.3} ms");
+    println!(
+        "  GPU-Q4_K: {:.1}x vs CPU-f32, {:.1}x vs GPU-f32",
+        cpu_f32 / gpu_q4k,
+        gpu_f32 / gpu_q4k
+    );
+}
+
+fn time_ms<F: FnMut()>(n: usize, mut f: F) -> f64 {
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        f();
+    }
+    t.elapsed().as_secs_f64() * 1000.0 / n as f64
 }

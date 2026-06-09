@@ -765,6 +765,7 @@ name = "ullm-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "rayon",
  "ullm-core",
  "ullm-gguf",
  "ullm-metal",

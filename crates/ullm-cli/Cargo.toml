@@ -20,3 +20,4 @@ ullm-model = { workspace = true }
 ullm-metal = { workspace = true }
 ullm-server = { workspace = true }
 clap = { workspace = true }
+rayon = { workspace = true }
