@@ -219,7 +219,7 @@ impl GpuForward {
             p_matvec_f32: pso("matvec_f32_sg")?,
             p_matvec_f16: pso("matvec_f16_mr")?,
             p_matvec_bf16: pso("matvec_bf16_mr")?,
-            p_matvec_q4k: pso("matvec_q4k_sg")?,
+            p_matvec_q4k: pso("matvec_q4k_mr")?,
             p_matvec_q6k: pso("matvec_q6k_mr")?,
             p_rmsnorm: pso("rmsnorm")?,
             p_rmsnorm_heads: pso("rmsnorm_heads")?,
@@ -473,7 +473,7 @@ impl GpuForward {
         const THREADS: u64 = 256;
         let sgs = THREADS / 32;
         let nr0 = match w.dtype {
-            DType::Q6K | DType::BF16 | DType::F16 => 2,
+            DType::Q6K | DType::Q4K | DType::BF16 | DType::F16 => 2,
             _ => 1,
         };
         let groups = (w.out as u64).div_ceil(sgs * nr0);

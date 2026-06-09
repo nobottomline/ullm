@@ -289,6 +289,81 @@ kernel void matvec_q6k_mr(
     }
 }
 
+// Multi-row Q4_K matvec (ported from ggml-metal kernel_mul_mv_q4_K). Each
+// simdgroup does NR0 rows; the 32 lanes cooperatively cover the block with
+// uint16 reads and a packed-scale trick. Activations loaded once per block.
+kernel void matvec_q4k_mr(
+    device const uchar* src0    [[buffer(0)]],
+    device const float* src1    [[buffer(1)]],
+    device float*       dst     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint   tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const short NR0 = 2;
+    const ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    short ix = tiisg / 8, it = tiisg % 8, iq = it / 4, ir = it % 4;
+    uint nb   = in_dim / 256u;
+    uint nb01 = nb * 144u;
+    int  first_row = (int)((uint)tgpig * nsg + sgitg) * NR0;
+    device const uchar* x0 = src0 + (uint)first_row * nb01;
+
+    float yl[16], yh[16];
+    float sumf[NR0] = { 0.f, 0.f };
+    device const float* y4 = src1 + (uint)ix * 256u + 64u * (uint)iq + 8u * (uint)ir;
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        float4 sumy = { 0.f, 0.f, 0.f, 0.f };
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+        for (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)out_dim) break;
+            device const uchar*  blk = x0 + (uint)row * nb01 + ib * 144u;
+            device const half*   dh  = (device const half*)(blk);
+            device const ushort* sc  = (device const ushort*)(blk + 4) + iq;
+            device const ushort* q1  = (device const ushort*)(blk + 16) + 16u*(uint)iq + 4u*(uint)ir;
+            device const ushort* q2  = q1 + 32;
+            ushort sc16[4];
+            thread const uchar* sc8 = (thread const uchar*)sc16;
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            float4 acc1 = { 0.f, 0.f, 0.f, 0.f };
+            float4 acc2 = { 0.f, 0.f, 0.f, 0.f };
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i+0] * (float)(q1[i] & 0x000F);
+                acc1[1] += yl[2*i+1] * (float)(q1[i] & 0x0F00);
+                acc1[2] += yl[2*i+8] * (float)(q1[i] & 0x00F0);
+                acc1[3] += yl[2*i+9] * (float)(q1[i] & 0xF000);
+                acc2[0] += yh[2*i+0] * (float)(q2[i] & 0x000F);
+                acc2[1] += yh[2*i+1] * (float)(q2[i] & 0x0F00);
+                acc2[2] += yh[2*i+8] * (float)(q2[i] & 0x00F0);
+                acc2[3] += yh[2*i+9] * (float)(q2[i] & 0xF000);
+            }
+            float dall = (float)dh[0], dmin = (float)dh[1];
+            sumf[row] += dall * ((acc1[0] + (1.f/256.f)*acc1[1]) * (float)sc8[0] +
+                                 (acc1[2] + (1.f/256.f)*acc1[3]) * (float)sc8[1] * (1.f/16.f) +
+                                 (acc2[0] + (1.f/256.f)*acc2[1]) * (float)sc8[4] +
+                                 (acc2[2] + (1.f/256.f)*acc2[3]) * (float)sc8[5] * (1.f/16.f))
+                       - dmin * (sumy[0]*(float)sc8[2] + sumy[1]*(float)sc8[3] +
+                                 sumy[2]*(float)sc8[6] + sumy[3]*(float)sc8[7]);
+        }
+        y4 += 4u * 256u;
+    }
+    for (short row = 0; row < NR0; ++row) {
+        float s = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < (int)out_dim) dst[first_row + row] = s;
+    }
+}
+
 // Multi-row BF16 matvec (for SafeTensors / HF weights). bf16 is the top 16 bits
 // of an f32, so dequant is a 16-bit left shift. Lanes stride the in_dim with
 // coalesced reads; each simdgroup does NR0 rows, reusing each activation.
