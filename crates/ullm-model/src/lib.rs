@@ -13,10 +13,10 @@ mod weights;
 use ullm_core::{DType, Error, Result};
 use ullm_gguf::GgufModel;
 
-pub use config::LlamaConfig;
+pub use config::{Arch, LlamaConfig};
 pub use sample::SampleParams;
 
-use math::{add_bias, matvec_q, rmsnorm, rope, silu, softmax};
+use math::{add_bias, gelu, matvec_q, rmsnorm, rope, rope_neox, silu, softmax};
 use sample::sample_token;
 use weights::{qweight, tensor_f32};
 
@@ -47,6 +47,11 @@ struct LayerWeights {
     q_bias: Option<Vec<f32>>,
     k_bias: Option<Vec<f32>>,
     v_bias: Option<Vec<f32>>,
+    // Gemma-style extras (None on Llama/Qwen).
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
+    post_attn_norm: Option<Vec<f32>>,
+    post_ffn_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
     w_gate: QWeight,
     w_up: QWeight,
@@ -67,16 +72,21 @@ pub struct LlamaModel {
 impl LlamaModel {
     /// Load a Llama model from a parsed GGUF file (any supported quantization).
     pub fn from_gguf(model: &GgufModel) -> Result<Self> {
-        let arch = model.architecture().unwrap_or_default().to_string();
-        if arch != "llama" && arch != "qwen2" {
-            return Err(Error::Unsupported(format!(
-                "architecture '{arch}' is not supported yet (llama and qwen2)"
-            )));
-        }
+        let arch_str = model.architecture().unwrap_or_default().to_string();
+        let arch = match arch_str.as_str() {
+            "llama" => Arch::Llama,
+            "qwen2" => Arch::Qwen2,
+            "gemma3" => Arch::Gemma3,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "architecture '{other}' is not supported yet (llama, qwen2, gemma3)"
+                )));
+            }
+        };
 
         // Metadata keys are namespaced by architecture, e.g. `llama.block_count`.
         let req_u = |suffix: &str| -> Result<u64> {
-            let k = format!("{arch}.{suffix}");
+            let k = format!("{arch_str}.{suffix}");
             model
                 .metadata_get(&k)
                 .and_then(|v| v.to_u64())
@@ -84,12 +94,12 @@ impl LlamaModel {
         };
         let opt_u = |suffix: &str| {
             model
-                .metadata_get(&format!("{arch}.{suffix}"))
+                .metadata_get(&format!("{arch_str}.{suffix}"))
                 .and_then(|v| v.to_u64())
         };
         let opt_f = |suffix: &str| {
             model
-                .metadata_get(&format!("{arch}.{suffix}"))
+                .metadata_get(&format!("{arch_str}.{suffix}"))
                 .and_then(|v| v.to_f32())
         };
 
@@ -98,7 +108,7 @@ impl LlamaModel {
         let n_layer = req_u("block_count")? as usize;
         let n_kv_head = opt_u("attention.head_count_kv").unwrap_or(n_head as u64) as usize;
         let n_ff = req_u("feed_forward_length")? as usize;
-        let n_ctx = opt_u("context_length").unwrap_or(2048) as usize;
+        let n_ctx = (opt_u("context_length").unwrap_or(2048) as usize).min(8192);
         let head_dim = opt_u("attention.key_length")
             .map(|v| v as usize)
             .unwrap_or(n_embd / n_head);
@@ -107,6 +117,7 @@ impl LlamaModel {
         let vocab_size = model.model_spec().vocab_size as usize;
 
         let config = LlamaConfig {
+            arch,
             n_embd,
             n_layer,
             n_head,
@@ -131,6 +142,11 @@ impl LlamaModel {
                 q_bias: tensor_f32(model, &format!("blk.{i}.attn_q.bias")).ok(),
                 k_bias: tensor_f32(model, &format!("blk.{i}.attn_k.bias")).ok(),
                 v_bias: tensor_f32(model, &format!("blk.{i}.attn_v.bias")).ok(),
+                q_norm: tensor_f32(model, &format!("blk.{i}.attn_q_norm.weight")).ok(),
+                k_norm: tensor_f32(model, &format!("blk.{i}.attn_k_norm.weight")).ok(),
+                post_attn_norm: tensor_f32(model, &format!("blk.{i}.post_attention_norm.weight"))
+                    .ok(),
+                post_ffn_norm: tensor_f32(model, &format!("blk.{i}.post_ffw_norm.weight")).ok(),
                 ffn_norm: tensor_f32(model, &format!("blk.{i}.ffn_norm.weight"))?,
                 w_gate: qweight(model, &format!("blk.{i}.ffn_gate.weight"))?,
                 w_up: qweight(model, &format!("blk.{i}.ffn_up.weight"))?,
@@ -158,6 +174,14 @@ impl LlamaModel {
     /// Run one decoding step for `token` at sequence position `pos`, returning
     /// the logits over the vocabulary. Updates the KV cache in place.
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        if self.config.arch == Arch::Gemma3 {
+            self.forward_gemma(token, pos)
+        } else {
+            self.forward_llama(token, pos)
+        }
+    }
+
+    fn forward_llama(&mut self, token: u32, pos: usize) -> Vec<f32> {
         let c = &self.config;
         let dim = c.n_embd;
         let head_dim = c.head_dim;
@@ -240,6 +264,120 @@ impl LlamaModel {
             let up = matvec_q(&lw.w_up, &xb);
             let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
             let down = matvec_q(&lw.w_down, &hidden);
+            for (xi, di) in x.iter_mut().zip(&down) {
+                *xi += di;
+            }
+        }
+
+        let x = rmsnorm(&x, &self.final_norm, eps);
+        matvec_q(&self.output, &x)
+    }
+
+    /// Gemma-3 forward: scaled embeddings, `(1+w)` RMSNorm, per-head Q/K-norm,
+    /// NeoX RoPE, GeGLU, and sandwich (post-attention / post-FFN) norms. Sliding
+    /// window attention is treated as full attention (correct for short context).
+    fn forward_gemma(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        let c = &self.config;
+        let dim = c.n_embd;
+        let head_dim = c.head_dim;
+        let kv_dim = c.n_kv_head * head_dim;
+        let q_dim = c.n_head * head_dim;
+        let kv_mul = c.n_head / c.n_kv_head;
+        let n_ctx = c.n_ctx;
+        let n_layer = c.n_layer;
+        let n_head = c.n_head;
+        let n_kv_head = c.n_kv_head;
+        let eps = c.eps;
+        let rope_theta = c.rope_theta;
+        let scale = (head_dim as f32).sqrt().recip();
+
+        let mut x = vec![0.0f32; dim];
+        {
+            let w = &self.tok_embeddings;
+            let rb = w.row_bytes();
+            let o = token as usize;
+            ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], &mut x)
+                .expect("dequantize embedding row");
+        }
+        // Gemma scales the input embeddings by sqrt(n_embd).
+        let emb_scale = (dim as f32).sqrt();
+        for xi in x.iter_mut() {
+            *xi *= emb_scale;
+        }
+
+        for l in 0..n_layer {
+            let lw = &self.layers[l];
+
+            // --- attention (pre-norm + sandwich post-norm) ---
+            let xb = rmsnorm(&x, &lw.attn_norm, eps);
+            let mut q = matvec_q(&lw.wq, &xb);
+            let mut k = matvec_q(&lw.wk, &xb);
+            let v = matvec_q(&lw.wv, &xb);
+
+            // Per-head Q/K RMSNorm before RoPE.
+            if let Some(qn) = &lw.q_norm {
+                for h in 0..n_head {
+                    let s = h * head_dim;
+                    let normed = rmsnorm(&q[s..s + head_dim], qn, eps);
+                    q[s..s + head_dim].copy_from_slice(&normed);
+                }
+            }
+            if let Some(kn) = &lw.k_norm {
+                for h in 0..n_kv_head {
+                    let s = h * head_dim;
+                    let normed = rmsnorm(&k[s..s + head_dim], kn, eps);
+                    k[s..s + head_dim].copy_from_slice(&normed);
+                }
+            }
+
+            // Gemma GGUF weights are not permuted: use NeoX (rotate-half) RoPE.
+            rope_neox(&mut q, n_head, head_dim, pos, rope_theta);
+            rope_neox(&mut k, n_kv_head, head_dim, pos, rope_theta);
+
+            let kv_base = l * n_ctx * kv_dim;
+            let off = kv_base + pos * kv_dim;
+            self.key_cache[off..off + kv_dim].copy_from_slice(&k);
+            self.val_cache[off..off + kv_dim].copy_from_slice(&v);
+
+            let mut att_out = vec![0.0f32; q_dim];
+            for h in 0..n_head {
+                let kvh = h / kv_mul;
+                let qh = &q[h * head_dim..h * head_dim + head_dim];
+                let mut scores: Vec<f32> = (0..=pos)
+                    .map(|t| {
+                        let ko = kv_base + t * kv_dim + kvh * head_dim;
+                        let kt = &self.key_cache[ko..ko + head_dim];
+                        qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale
+                    })
+                    .collect();
+                softmax(&mut scores);
+                let oo = h * head_dim;
+                for (t, &a) in scores.iter().enumerate() {
+                    let vo = kv_base + t * kv_dim + kvh * head_dim;
+                    let vt = &self.val_cache[vo..vo + head_dim];
+                    for (dst, &vv) in att_out[oo..oo + head_dim].iter_mut().zip(vt) {
+                        *dst += a * vv;
+                    }
+                }
+            }
+
+            let mut attn = matvec_q(&lw.wo, &att_out);
+            if let Some(w) = &lw.post_attn_norm {
+                attn = rmsnorm(&attn, w, eps);
+            }
+            for (xi, ai) in x.iter_mut().zip(&attn) {
+                *xi += ai;
+            }
+
+            // --- feed-forward (GeGLU + sandwich post-norm) ---
+            let xb = rmsnorm(&x, &lw.ffn_norm, eps);
+            let gate = matvec_q(&lw.w_gate, &xb);
+            let up = matvec_q(&lw.w_up, &xb);
+            let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| gelu(*g) * u).collect();
+            let mut down = matvec_q(&lw.w_down, &hidden);
+            if let Some(w) = &lw.post_ffn_norm {
+                down = rmsnorm(&down, w, eps);
+            }
             for (xi, di) in x.iter_mut().zip(&down) {
                 *xi += di;
             }

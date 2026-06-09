@@ -72,6 +72,29 @@ pub(crate) fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize,
     }
 }
 
+/// NeoX / "rotate-half" RoPE: rotates `(x[i], x[i+d/2])`. Kept for architectures
+/// whose GGUF weights are not permuted into the interleaved layout.
+#[allow(dead_code)]
+pub(crate) fn rope_neox(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
+    let half = head_dim / 2;
+    for h in 0..n_heads {
+        let off = h * head_dim;
+        for i in 0..half {
+            let freq = theta.powf(2.0 * i as f32 / head_dim as f32).recip();
+            let (sin, cos) = (pos as f32 * freq).sin_cos();
+            let (a, b) = (vec[off + i], vec[off + i + half]);
+            vec[off + i] = a * cos - b * sin;
+            vec[off + i + half] = a * sin + b * cos;
+        }
+    }
+}
+
+/// GELU activation (tanh approximation, as used by Gemma's GeGLU).
+pub(crate) fn gelu(x: f32) -> f32 {
+    let c = (2.0f32 / std::f32::consts::PI).sqrt(); // sqrt(2 / pi)
+    0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
