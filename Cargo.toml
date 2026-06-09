@@ -1,0 +1,25 @@
+# uLLM — universal LLM inference engine.
+# Workspace manifest. Crates live under crates/.
+[workspace]
+resolver = "2"
+members = ["crates/ullm-core", "crates/ullm-cli"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["nobottomline"]
+repository = "https://github.com/nobottomline/ullm"
+homepage = "https://github.com/nobottomline/ullm"
+
+[workspace.dependencies]
+ullm-core = { path = "crates/ullm-core" }
+clap = { version = "4.5", features = ["derive"] }
+
+# Release profile tuned for a small, fast binary (lightweight is a product goal).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
