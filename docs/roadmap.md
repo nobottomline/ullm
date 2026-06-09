@@ -37,6 +37,7 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 - ☑ Byte-level BPE tokenizer — runs the Llama-3 / GPT-2 / Qwen family (verified on Llama-3.2-1B)
 - ☑ Qwen2 architecture (Q/K/V attention bias) — verified on Qwen2.5-1.5B-Instruct
 - ☑ Gemma 3 architecture (scaled embeddings, Q/K-norm, sandwich norms, GeGLU, NeoX RoPE) — verified on gemma-3-4b Q6_K vs llama.cpp
-- ☐ SafeTensors + PyTorch loaders
+- ☑ Qwen3 architecture (per-head Q/K-norm, NeoX RoPE, tied embeddings) — runs from SafeTensors
+- ◐ SafeTensors / Hugging Face loader — `WeightSource` trait unifies GGUF + SafeTensors; loads single-file and sharded BF16/F16/F32 models + `tokenizer.json`; runs Qwen3-4B end-to-end. PyTorch `.bin` loader still TODO
 - ☐ Vulkan and CUDA backends
 - ☐ Data-driven (block-composed) model definitions
