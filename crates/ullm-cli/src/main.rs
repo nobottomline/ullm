@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use ullm_core::device::Hardware;
 use ullm_gguf::GgufModel;
-use ullm_model::LlamaModel;
+use ullm_model::{LlamaModel, SampleParams};
 
 #[derive(Parser)]
 #[command(name = "ullm", version, about = "Universal LLM inference engine")]
@@ -40,6 +40,18 @@ enum Command {
         /// Maximum number of new tokens to generate.
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
+        /// Sampling temperature (0 = greedy / deterministic).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Keep only the top-k logits (0 = disabled).
+        #[arg(long, default_value_t = 0)]
+        top_k: usize,
+        /// Nucleus sampling threshold (1.0 = disabled).
+        #[arg(long, default_value_t = 1.0)]
+        top_p: f32,
+        /// RNG seed (0 = fixed default).
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
     },
     /// Start an OpenAI-compatible server (not yet implemented).
     Serve,
@@ -55,7 +67,21 @@ fn main() {
             path,
             prompt,
             max_tokens,
-        } => run(&path, &prompt, max_tokens),
+            temperature,
+            top_k,
+            top_p,
+            seed,
+        } => run(
+            &path,
+            &prompt,
+            max_tokens,
+            SampleParams {
+                temperature,
+                top_k,
+                top_p,
+                seed,
+            },
+        ),
         Command::Serve => {
             eprintln!("not yet implemented — see docs/roadmap.md (Phase 0)");
             std::process::exit(1);
@@ -162,7 +188,7 @@ fn tokenize(path: &Path, text: &str) {
     println!("decoded:  {:?}", tk.decode(&ids));
 }
 
-fn run(path: &Path, prompt: &str, max_tokens: usize) {
+fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams) {
     let model = match GgufModel::open(path) {
         Ok(m) => m,
         Err(e) => {
@@ -186,7 +212,7 @@ fn run(path: &Path, prompt: &str, max_tokens: usize) {
     };
 
     let prompt_ids = tk.encode(prompt, true);
-    let generated = lm.generate(&prompt_ids, max_tokens, tk.eos_id());
+    let generated = lm.generate(&prompt_ids, max_tokens, tk.eos_id(), &params);
 
     let mut full = prompt_ids.clone();
     full.extend_from_slice(&generated);
