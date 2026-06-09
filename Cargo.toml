@@ -37,6 +37,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+fancy-regex = "0.13"
 
 # Release profile tuned for a small, fast binary (lightweight is a product goal).
 [profile.release]

@@ -20,7 +20,7 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 
 - ☑ Quantized weight loading on CPU (F16/BF16, Q8_0, Q4_0/1, Q5_0/1, Q4_K/Q5_K/Q6_K) — runs real Q4_K_M models
 - ◐ Metal backend — validated f32 + **Q4_K/Q6_K dequant-in-kernel** GEMV, unified-memory buffers (`ullm metal-check`); forward integration + benchmark next
-- ☐ KV cache + sampler
+- ☑ KV cache + sampling (greedy / temperature / top-k / top-p)
 - ☑ OpenAI-compatible server — `/v1/chat/completions` (SSE streaming + non-streaming) + `/v1/models` (`ullm serve`)
 - ☐ Startup-time + tokens/s benchmarks vs llama.cpp / MLX
 
@@ -34,6 +34,7 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 
 ## Phase 3 — Broaden
 
+- ☑ Byte-level BPE tokenizer — runs the Llama-3 / GPT-2 / Qwen family (verified on Llama-3.2-1B)
 - ☐ SafeTensors + PyTorch loaders
 - ☐ Vulkan and CUDA backends
 - ☐ Data-driven (block-composed) model definitions

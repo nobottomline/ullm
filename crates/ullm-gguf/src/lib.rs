@@ -231,14 +231,8 @@ impl GgufModel {
             .get("tokenizer.ggml.model")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if model_type != "llama" {
-            return Err(Error::Unsupported(format!(
-                "tokenizer model '{model_type}' is not supported yet (only llama/SPM)"
-            )));
-        }
 
         let tokens = self.string_array("tokenizer.ggml.tokens")?;
-        let scores = self.f32_array("tokenizer.ggml.scores")?;
         let token_types = self
             .i32_array("tokenizer.ggml.token_type")
             .unwrap_or_default();
@@ -255,17 +249,41 @@ impl GgufModel {
                 .map(|v| v != 0)
                 .unwrap_or(default)
         };
+        let bos = special("tokenizer.ggml.bos_token_id");
+        let eos = special("tokenizer.ggml.eos_token_id");
 
-        Tokenizer::from_sentencepiece(
-            tokens,
-            scores,
-            token_types,
-            special("tokenizer.ggml.bos_token_id"),
-            special("tokenizer.ggml.eos_token_id"),
-            special("tokenizer.ggml.unknown_token_id"),
-            flag("tokenizer.ggml.add_bos_token", true),
-            flag("tokenizer.ggml.add_space_prefix", true),
-        )
+        match model_type {
+            "llama" => Tokenizer::from_sentencepiece(
+                tokens,
+                self.f32_array("tokenizer.ggml.scores")?,
+                token_types,
+                bos,
+                eos,
+                special("tokenizer.ggml.unknown_token_id"),
+                flag("tokenizer.ggml.add_bos_token", true),
+                flag("tokenizer.ggml.add_space_prefix", true),
+            ),
+            "gpt2" => {
+                let merges = self.string_array("tokenizer.ggml.merges")?;
+                let pre = self
+                    .metadata
+                    .get("tokenizer.ggml.pre")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
+                Tokenizer::from_bpe(
+                    tokens,
+                    merges,
+                    token_types,
+                    bos,
+                    eos,
+                    flag("tokenizer.ggml.add_bos_token", true),
+                    pre,
+                )
+            }
+            other => Err(Error::Unsupported(format!(
+                "tokenizer model '{other}' is not supported (llama/SPM and gpt2/BPE only)"
+            ))),
+        }
     }
 
     fn string_array(&self, key: &str) -> Result<Vec<String>> {
