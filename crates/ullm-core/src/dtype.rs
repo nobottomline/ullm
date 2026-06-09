@@ -24,6 +24,9 @@ pub enum DType {
     Q5K,
     Q6K,
     Q8K,
+    /// Raw 32-bit words — used for MLX's packed 4-bit weights (8 nibbles/word),
+    /// dequantized via separate scale/bias tensors, not the block path.
+    U32,
 }
 
 impl DType {
@@ -39,19 +42,20 @@ impl DType {
             Q4_0 | Q4_1 | Q4K => 4.5,
             Q3K => 3.4375,
             Q2K => 2.625,
+            U32 => 32.0,
         }
     }
 
     /// Whether this is a quantized (block) type.
     pub fn is_quantized(self) -> bool {
-        !matches!(self, DType::F32 | DType::F16 | DType::BF16)
+        !matches!(self, DType::F32 | DType::F16 | DType::BF16 | DType::U32)
     }
 
     /// Number of weights stored per block.
     pub fn block_size(self) -> usize {
         use DType::*;
         match self {
-            F32 | F16 | BF16 => 1,
+            F32 | F16 | BF16 | U32 => 1,
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 => 32,
             Q2K | Q3K | Q4K | Q5K | Q6K | Q8K => 256,
         }
@@ -61,7 +65,7 @@ impl DType {
     pub fn type_size(self) -> usize {
         use DType::*;
         match self {
-            F32 => 4,
+            F32 | U32 => 4,
             F16 | BF16 => 2,
             Q4_0 => 18,
             Q4_1 => 20,

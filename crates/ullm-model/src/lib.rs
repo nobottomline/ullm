@@ -7,6 +7,7 @@
 
 mod config;
 mod math;
+mod mlx;
 mod sample;
 mod weights;
 
@@ -58,6 +59,12 @@ struct LayerWeights {
     w_gate: QWeight,
     w_up: QWeight,
     w_down: QWeight,
+    // Mixture-of-experts FFN: when `moe_gate` is set, the dense `w_*` above are
+    // placeholders and the router selects among the per-expert weights instead.
+    moe_gate: Option<QWeight>,
+    experts_gate: Vec<QWeight>,
+    experts_up: Vec<QWeight>,
+    experts_down: Vec<QWeight>,
 }
 
 /// A loaded Llama model with its KV cache.
@@ -135,6 +142,9 @@ impl LlamaModel {
             n_ctx,
             rope_theta,
             eps,
+            n_experts: 0,
+            n_experts_used: 0,
+            moe_inter: 0,
         };
 
         let tok_embeddings = qweight(model, "token_embd.weight")?;
@@ -158,6 +168,10 @@ impl LlamaModel {
                 w_gate: qweight(model, &format!("blk.{i}.ffn_gate.weight"))?,
                 w_up: qweight(model, &format!("blk.{i}.ffn_up.weight"))?,
                 w_down: qweight(model, &format!("blk.{i}.ffn_down.weight"))?,
+                moe_gate: None,
+                experts_gate: Vec::new(),
+                experts_up: Vec::new(),
+                experts_down: Vec::new(),
             });
         }
         let final_norm = tensor_f32(model, "output_norm.weight")?;
@@ -235,6 +249,9 @@ impl LlamaModel {
             n_ctx,
             rope_theta,
             eps,
+            n_experts: 0,
+            n_experts_used: 0,
+            moe_inter: 0,
         };
 
         let tok_embeddings = qweight(model, "model.embed_tokens.weight")?;
@@ -258,6 +275,10 @@ impl LlamaModel {
                 w_gate: qweight(model, &format!("{p}.mlp.gate_proj.weight"))?,
                 w_up: qweight(model, &format!("{p}.mlp.up_proj.weight"))?,
                 w_down: qweight(model, &format!("{p}.mlp.down_proj.weight"))?,
+                moe_gate: None,
+                experts_gate: Vec::new(),
+                experts_up: Vec::new(),
+                experts_down: Vec::new(),
             });
         }
         let final_norm = tensor_f32(model, "model.norm.weight")?;
@@ -339,6 +360,11 @@ impl LlamaModel {
     }
 
     fn build_gpu(&self) -> Result<GpuForward> {
+        if self.layers.iter().any(|l| l.moe_gate.is_some()) {
+            return Err(Error::Unsupported(
+                "GPU forward does not support mixture-of-experts yet".into(),
+            ));
+        }
         let c = &self.config;
         let qk_norm = self.layers.first().is_some_and(|l| l.q_norm.is_some());
         let sandwich_norm = self.layers.first().is_some_and(|l| l.post_attn_norm.is_some());
@@ -498,12 +524,16 @@ impl LlamaModel {
                 *xi += ai;
             }
 
-            // --- feed-forward (SwiGLU) ---
+            // --- feed-forward (SwiGLU, or mixture-of-experts) ---
             let xb = rmsnorm(&x, &lw.ffn_norm, eps);
-            let gate = matvec_q(&lw.w_gate, &xb);
-            let up = matvec_q(&lw.w_up, &xb);
-            let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-            let down = matvec_q(&lw.w_down, &hidden);
+            let down = if let Some(gate_w) = &lw.moe_gate {
+                moe_ffn(lw, gate_w, &xb, c.n_experts_used)
+            } else {
+                let gate = matvec_q(&lw.w_gate, &xb);
+                let up = matvec_q(&lw.w_up, &xb);
+                let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
+                matvec_q(&lw.w_down, &hidden)
+            };
             for (xi, di) in x.iter_mut().zip(&down) {
                 *xi += di;
             }
@@ -682,4 +712,42 @@ impl LlamaModel {
         });
         out
     }
+}
+
+/// Mixture-of-experts feed-forward: route `xb` to the top-k experts by router
+/// logit, then sum their SwiGLU outputs weighted by the renormalized softmax.
+fn moe_ffn(lw: &LayerWeights, gate_w: &QWeight, xb: &[f32], n_used: usize) -> Vec<f32> {
+    let logits = matvec_q(gate_w, xb);
+    // Top-k experts by router logit.
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    idx.truncate(n_used);
+    // Softmax over the selected logits (== softmax over all then renormalize).
+    let max = idx.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
+    let mut wsum = 0.0f32;
+    let mut weights: Vec<f32> = idx
+        .iter()
+        .map(|&i| {
+            let e = (logits[i] - max).exp();
+            wsum += e;
+            e
+        })
+        .collect();
+    for w in &mut weights {
+        *w /= wsum;
+    }
+    // Accumulate the weighted expert outputs.
+    let dim = lw.experts_down.first().map(|q| q.out).unwrap_or(0);
+    let mut out = vec![0.0f32; dim];
+    for (k, &e) in idx.iter().enumerate() {
+        let gate = matvec_q(&lw.experts_gate[e], xb);
+        let up = matvec_q(&lw.experts_up[e], xb);
+        let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
+        let down = matvec_q(&lw.experts_down[e], &hidden);
+        let wk = weights[k];
+        for (o, d) in out.iter_mut().zip(&down) {
+            *o += wk * d;
+        }
+    }
+    out
 }

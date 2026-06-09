@@ -9,6 +9,8 @@ pub enum Arch {
     Qwen2,
     /// Qwen3 — per-head Q/K RMSNorm before RoPE, no attention bias.
     Qwen3,
+    /// Qwen3-MoE — Qwen3 attention + a top-k mixture-of-experts feed-forward.
+    Qwen3Moe,
     /// Gemma 3 — `sqrt(n_embd)`-scaled embeddings, Q/K-norm, sandwich
     /// (post-attention / post-FFN) RMSNorms, GeGLU, and NeoX-style RoPE.
     /// Note: the GGUF converter folds Gemma's `(1 + w)` norm gain into the
@@ -30,4 +32,10 @@ pub struct LlamaConfig {
     pub n_ctx: usize,
     pub rope_theta: f32,
     pub eps: f32,
+    /// Mixture-of-experts (0 for dense models).
+    pub n_experts: usize,
+    /// Experts selected per token (top-k routing).
+    pub n_experts_used: usize,
+    /// Per-expert feed-forward width.
+    pub moe_inter: usize,
 }

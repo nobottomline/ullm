@@ -209,9 +209,10 @@ fn parse_dtype(s: &str) -> Result<DType> {
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::BF16,
+        "U32" | "I32" => DType::U32, // MLX packed 4-bit weights
         other => {
             return Err(Error::Unsupported(format!(
-                "SafeTensors dtype '{other}' (only F32/F16/BF16 are supported)"
+                "SafeTensors dtype '{other}' (only F32/F16/BF16/U32 are supported)"
             )));
         }
     })
@@ -221,7 +222,7 @@ fn parse_dtype(s: &str) -> Result<DType> {
 fn byte_len(dtype: DType, shape: &[usize]) -> Option<usize> {
     let n: usize = shape.iter().product();
     let elsize = match dtype {
-        DType::F32 => 4,
+        DType::F32 | DType::U32 => 4,
         DType::F16 | DType::BF16 => 2,
         _ => return None,
     };

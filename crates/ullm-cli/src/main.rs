@@ -402,7 +402,12 @@ fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams, gpu: 
     let (tk, mut lm) = if is_safetensors(path) {
         let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
         let tk = load_hf_tokenizer(path);
-        let lm = LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e));
+        // MLX models carry a `quantization` block in config.json.
+        let lm = if st.config().get("quantization").is_some() {
+            LlamaModel::from_mlx(&st).unwrap_or_else(|e| exit(e))
+        } else {
+            LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e))
+        };
         (tk, lm) // `st`'s mmap drops here; `lm` owns copied weights
     } else {
         let model = GgufModel::open(path).unwrap_or_else(|e| exit(e));
