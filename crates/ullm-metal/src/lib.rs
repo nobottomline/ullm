@@ -224,6 +224,71 @@ kernel void matvec_q6k_sg(
     if (lane == 0 && o < out_dim) y[o] = acc;
 }
 
+// Multi-row Q6_K matvec (llama.cpp technique): each simdgroup computes NR0
+// output rows at once, loading the activation block into registers once and
+// reusing it across the rows. Each lane owns a fixed 16-element pattern across
+// blocks (coalesced reads), reduced with simd_sum.
+kernel void matvec_q6k_mr(
+    device const uchar* src0    [[buffer(0)]],
+    device const float* src1    [[buffer(1)]],
+    device float*       dst     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint   tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const short NR0 = 4;
+    uint nb   = in_dim / 256u;
+    uint nb01 = nb * 210u;                       // bytes per weight row
+    int  first_row = (int)((uint)tgpig * nsg + sgitg) * NR0;
+
+    short tid = tiisg / 2, ix = tiisg % 2;
+    short ip  = tid / 8,   il = tid % 8;
+    short l0  = 4 * il;
+    short is  = 8 * ip + l0 / 16;
+    short y_offset   = 128 * ip + l0;
+    short q_offset_l =  64 * ip + l0;
+    short q_offset_h =  32 * ip + l0;
+
+    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+    float yl[16];
+
+    device const uchar* x0 = src0 + (uint)first_row * nb01;
+
+    for (uint i = ix; i < nb; i += 2) {
+        device const float* y = src1 + i * 256u + y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
+        }
+        for (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)out_dim) break;
+            device const uchar* blk = x0 + (uint)row * nb01 + i * 210u;
+            device const uchar* q1 = blk + q_offset_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = blk + 128 + q_offset_h;
+            device const char*  sc = (device const char*)(blk + 192) + is;
+            float d = (float)as_type<half>((ushort)(blk[208] | (blk[209] << 8)));
+            float4 sums = { 0.f, 0.f, 0.f, 0.f };
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4*l+0] * (float)((int)((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32);
+                sums[1] += yl[4*l+1] * (float)((int)((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32);
+                sums[2] += yl[4*l+2] * (float)((int)((q1[l]  >> 4) | ((qh[l] & 0x30) << 0)) - 32);
+                sums[3] += yl[4*l+3] * (float)((int)((q2[l]  >> 4) | ((qh[l] & 0xC0) >> 2)) - 32);
+            }
+            sumf[row] += d * (sums[0]*sc[0] + sums[1]*sc[2] + sums[2]*sc[4] + sums[3]*sc[6]);
+        }
+    }
+    for (short row = 0; row < NR0; ++row) {
+        float s = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < (int)out_dim) dst[first_row + row] = s;
+    }
+}
+
 // ---- Full-forward kernels (activations resident on the GPU) ----
 
 // RMSNorm over `n` elements with a per-channel gain. `y` may alias `x`.

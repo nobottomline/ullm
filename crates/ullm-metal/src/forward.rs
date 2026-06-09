@@ -216,7 +216,7 @@ impl GpuForward {
         Ok(Self {
             p_matvec_f32: pso("matvec_f32_sg")?,
             p_matvec_q4k: pso("matvec_q4k_sg")?,
-            p_matvec_q6k: pso("matvec_q6k_sg")?,
+            p_matvec_q6k: pso("matvec_q6k_mr")?,
             p_rmsnorm: pso("rmsnorm")?,
             p_rmsnorm_heads: pso("rmsnorm_heads")?,
             p_rope_neox: pso("rope_neox")?,
@@ -462,10 +462,12 @@ impl GpuForward {
         let out_dim = w.out as u32;
         enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
         enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
-        // One simdgroup (32 lanes) per output row; 8 simdgroups per threadgroup.
+        // 8 simdgroups per threadgroup; the Q6_K kernel computes NR0=4 rows per
+        // simdgroup (activation reuse), the others 1 row per simdgroup.
         const THREADS: u64 = 256;
         let sgs = THREADS / 32;
-        let groups = (w.out as u64).div_ceil(sgs);
+        let nr0 = if w.dtype == DType::Q6K { 4 } else { 1 };
+        let groups = (w.out as u64).div_ceil(sgs * nr0);
         enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
     }
 
