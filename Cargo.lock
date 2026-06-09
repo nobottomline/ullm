@@ -866,6 +866,7 @@ dependencies = [
  "rayon",
  "ullm-core",
  "ullm-gguf",
+ "ullm-metal",
  "ullm-safetensors",
 ]
 

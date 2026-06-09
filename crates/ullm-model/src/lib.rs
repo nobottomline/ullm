@@ -12,6 +12,7 @@ mod weights;
 
 use ullm_core::{DType, Error, Result};
 use ullm_gguf::GgufModel;
+use ullm_metal::{GpuForward, GpuLayerInput, GpuModelInput, GpuParams, GpuWeight};
 use ullm_safetensors::SafeTensorsModel;
 
 pub use config::{Arch, LlamaConfig};
@@ -71,6 +72,8 @@ pub struct LlamaModel {
     /// RoPE convention: NeoX (rotate-half) for un-permuted weights loaded from
     /// SafeTensors / HF; interleaved for GGUF (whose Llama weights are permuted).
     rope_neox: bool,
+    /// Optional resident GPU forward; when present, `forward` runs on the GPU.
+    gpu: Option<GpuForward>,
 }
 
 impl LlamaModel {
@@ -172,8 +175,10 @@ impl LlamaModel {
             output,
             key_cache: cache.clone(),
             val_cache: cache,
-            // GGUF Llama/Qwen weights are permuted for interleaved RoPE.
-            rope_neox: false,
+            // GGUF Llama/Qwen weights are permuted for interleaved RoPE; Gemma
+            // GGUF weights are not, so Gemma uses NeoX even from GGUF.
+            rope_neox: arch == Arch::Gemma3,
+            gpu: None,
         })
     }
 
@@ -272,17 +277,124 @@ impl LlamaModel {
             val_cache: cache,
             // HF weights are not permuted: use NeoX RoPE.
             rope_neox: true,
+            gpu: None,
         })
     }
 
     /// Run one decoding step for `token` at sequence position `pos`, returning
     /// the logits over the vocabulary. Updates the KV cache in place.
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        if self.gpu.is_some() {
+            let x_init = self.embed(token);
+            return self
+                .gpu
+                .as_ref()
+                .unwrap()
+                .forward(&x_init, pos)
+                .expect("gpu forward");
+        }
         if self.config.arch == Arch::Gemma3 {
             self.forward_gemma(token, pos)
         } else {
             self.forward_llama(token, pos)
         }
+    }
+
+    /// Move the model's weights onto the GPU and route `forward` through the
+    /// single-command-buffer Metal forward pass. Falls back to CPU if no GPU.
+    pub fn enable_gpu(&mut self) -> Result<()> {
+        let gpu = self.build_gpu()?;
+        self.gpu = Some(gpu);
+        Ok(())
+    }
+
+    /// Whether the GPU forward path is active.
+    pub fn gpu_enabled(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// Step through GPU layer 0 op-by-op, reporting NaN/inf/max (debugging).
+    pub fn gpu_forward_debug(&self, token: u32, pos: usize) {
+        if let Some(gpu) = &self.gpu {
+            let x = self.embed(token);
+            gpu.forward_debug(&x, pos);
+        }
+    }
+
+    /// The (already scaled, for Gemma) input embedding for `token`.
+    fn embed(&self, token: u32) -> Vec<f32> {
+        let w = &self.tok_embeddings;
+        let rb = w.row_bytes();
+        let o = token as usize;
+        let mut x = vec![0.0f32; self.config.n_embd];
+        ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], &mut x)
+            .expect("dequantize embedding row");
+        if self.config.arch == Arch::Gemma3 {
+            let s = (self.config.n_embd as f32).sqrt();
+            for xi in &mut x {
+                *xi *= s;
+            }
+        }
+        x
+    }
+
+    fn build_gpu(&self) -> Result<GpuForward> {
+        let c = &self.config;
+        let qk_norm = self.layers.first().is_some_and(|l| l.q_norm.is_some());
+        let sandwich_norm = self.layers.first().is_some_and(|l| l.post_attn_norm.is_some());
+        let params = GpuParams {
+            n_embd: c.n_embd,
+            n_layer: c.n_layer,
+            n_head: c.n_head,
+            n_kv_head: c.n_kv_head,
+            head_dim: c.head_dim,
+            n_ff: c.n_ff,
+            n_ctx: c.n_ctx,
+            vocab: c.vocab_size,
+            rope_theta: c.rope_theta,
+            eps: c.eps,
+            rope_neox: self.rope_neox,
+            qk_norm,
+            sandwich_norm,
+            geglu: c.arch == Arch::Gemma3,
+        };
+        fn gw(w: &QWeight) -> GpuWeight<'_> {
+            GpuWeight {
+                dtype: w.dtype,
+                bytes: &w.data,
+                out: w.out,
+                cols: w.cols,
+            }
+        }
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| GpuLayerInput {
+                attn_norm: &l.attn_norm,
+                wq: gw(&l.wq),
+                wk: gw(&l.wk),
+                wv: gw(&l.wv),
+                wo: gw(&l.wo),
+                q_bias: l.q_bias.as_deref(),
+                k_bias: l.k_bias.as_deref(),
+                v_bias: l.v_bias.as_deref(),
+                q_norm: l.q_norm.as_deref(),
+                k_norm: l.k_norm.as_deref(),
+                post_attn_norm: l.post_attn_norm.as_deref(),
+                post_ffn_norm: l.post_ffn_norm.as_deref(),
+                ffn_norm: &l.ffn_norm,
+                w_gate: gw(&l.w_gate),
+                w_up: gw(&l.w_up),
+                w_down: gw(&l.w_down),
+            })
+            .collect();
+        let input = GpuModelInput {
+            params,
+            output: gw(&self.output),
+            final_norm: &self.final_norm,
+            layers,
+        };
+        GpuForward::new(&input)
     }
 
     fn forward_llama(&mut self, token: u32, pos: usize) -> Vec<f32> {

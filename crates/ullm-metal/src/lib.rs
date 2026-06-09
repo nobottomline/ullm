@@ -9,7 +9,10 @@
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use ullm_core::{DType, Error, Result};
 
-const SHADER: &str = r#"
+mod forward;
+pub use forward::{GpuForward, GpuLayerInput, GpuModelInput, GpuParams, GpuWeight};
+
+pub(crate) const SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -100,6 +103,218 @@ kernel void matvec_q6k(
         }
     }
     y[o] = acc;
+}
+
+// ---- Full-forward kernels (activations resident on the GPU) ----
+
+// RMSNorm over `n` elements with a per-channel gain. `y` may alias `x`.
+kernel void rmsnorm(
+    device const float* x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device float*       y [[buffer(2)]],
+    constant uint&      n [[buffer(3)]],
+    constant float&     eps [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt  [[threads_per_threadgroup]])
+{
+    threadgroup float sh[1024];
+    float local = 0.0f;
+    for (uint i = tid; i < n; i += nt) local += x[i] * x[i];
+    sh[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nt / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(sh[0] / (float)n + eps);
+    for (uint i = tid; i < n; i += nt) y[i] = x[i] * inv * w[i];
+}
+
+// Per-head RMSNorm: one threadgroup per head, normalizing a head_dim slice in
+// place with a shared weight. Used for Gemma/Qwen3 Q/K-norm.
+kernel void rmsnorm_heads(
+    device float*       x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    constant uint&      head_dim [[buffer(2)]],
+    constant float&     eps [[buffer(3)]],
+    uint h   [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt  [[threads_per_threadgroup]])
+{
+    device float* xh = x + h * head_dim;
+    threadgroup float sh[1024];
+    float local = 0.0f;
+    for (uint i = tid; i < head_dim; i += nt) local += xh[i] * xh[i];
+    sh[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nt / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(sh[0] / (float)head_dim + eps);
+    for (uint i = tid; i < head_dim; i += nt) xh[i] = xh[i] * inv * w[i];
+}
+
+// NeoX (rotate-half) RoPE, in place; one thread per rotated pair.
+kernel void rope_neox(
+    device float*    v [[buffer(0)]],
+    constant uint&   n_heads  [[buffer(1)]],
+    constant uint&   head_dim [[buffer(2)]],
+    constant uint&   pos      [[buffer(3)]],
+    constant float&  theta    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint halfd = head_dim / 2u;
+    if (gid >= n_heads * halfd) return;
+    uint h = gid / halfd, i = gid % halfd;
+    uint off = h * head_dim;
+    float freq = pow(theta, -2.0f * (float)i / (float)head_dim);
+    float ang = (float)pos * freq;
+    float c = cos(ang), s = sin(ang);
+    float a = v[off + i], b = v[off + i + halfd];
+    v[off + i]         = a * c - b * s;
+    v[off + i + halfd] = a * s + b * c;
+}
+
+// Interleaved (ggml "NORM") RoPE, in place; one thread per rotated pair.
+kernel void rope_norm(
+    device float*    v [[buffer(0)]],
+    constant uint&   n_heads  [[buffer(1)]],
+    constant uint&   head_dim [[buffer(2)]],
+    constant uint&   pos      [[buffer(3)]],
+    constant float&  theta    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint halfd = head_dim / 2u;
+    if (gid >= n_heads * halfd) return;
+    uint h = gid / halfd, i = gid % halfd;
+    uint off = h * head_dim + 2u * i;
+    float freq = pow(theta, (float)(2u * i) / (float)head_dim);
+    float ang = (float)pos / freq;     // theta^(-2i/hd) == 1/theta^(2i/hd)
+    float c = cos(ang), s = sin(ang);
+    float a = v[off], b = v[off + 1u];
+    v[off]      = a * c - b * s;
+    v[off + 1u] = a * s + b * c;
+}
+
+// Attention scores: scores[h,t] = scale * dot(q_h, K[t, kvh]).
+kernel void attn_scores(
+    device const float* q       [[buffer(0)]],
+    device const float* kcache  [[buffer(1)]],  // bound at the layer's offset
+    device float*       scores  [[buffer(2)]],
+    constant uint&      head_dim [[buffer(3)]],
+    constant uint&      kv_dim   [[buffer(4)]],
+    constant uint&      kv_mul   [[buffer(5)]],
+    constant uint&      stride   [[buffer(6)]],  // scores row stride (n_ctx)
+    constant float&     scale    [[buffer(7)]],
+    constant uint&      seqlen   [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])       // x = t, y = h
+{
+    uint t = gid.x, h = gid.y;
+    if (t >= seqlen) return;
+    uint kvh = h / kv_mul;
+    device const float* qh = q + h * head_dim;
+    device const float* kt = kcache + t * kv_dim + kvh * head_dim;
+    float s = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) s += qh[d] * kt[d];
+    scores[h * stride + t] = s * scale;
+}
+
+// In-place softmax over each head's score row.
+kernel void attn_softmax(
+    device float*  scores [[buffer(0)]],
+    constant uint& stride [[buffer(1)]],
+    constant uint& seqlen [[buffer(2)]],
+    uint h   [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt  [[threads_per_threadgroup]])
+{
+    device float* row = scores + h * stride;
+    threadgroup float sh[1024];
+    float m = -INFINITY;
+    for (uint t = tid; t < seqlen; t += nt) m = max(m, row[t]);
+    sh[tid] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nt / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sh[tid] = max(sh[tid], sh[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mx = sh[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.0f;
+    for (uint t = tid; t < seqlen; t += nt) { float e = exp(row[t] - mx); row[t] = e; sum += e; }
+    sh[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nt / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / sh[0];
+    for (uint t = tid; t < seqlen; t += nt) row[t] *= inv;
+}
+
+// Attention output: out[h,d] = sum_t scores[h,t] * V[t, kvh, d].
+kernel void attn_output(
+    device const float* scores [[buffer(0)]],
+    device const float* vcache [[buffer(1)]],  // bound at the layer's offset
+    device float*       out    [[buffer(2)]],
+    constant uint&      head_dim [[buffer(3)]],
+    constant uint&      kv_dim   [[buffer(4)]],
+    constant uint&      kv_mul   [[buffer(5)]],
+    constant uint&      stride   [[buffer(6)]],
+    constant uint&      seqlen   [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])       // x = d, y = h
+{
+    uint d = gid.x, h = gid.y;
+    if (d >= head_dim) return;
+    uint kvh = h / kv_mul;
+    device const float* row = scores + h * stride;
+    float acc = 0.0f;
+    for (uint t = 0; t < seqlen; ++t) acc += row[t] * vcache[t * kv_dim + kvh * head_dim + d];
+    out[h * head_dim + d] = acc;
+}
+
+// SwiGLU: hidden[i] = silu(gate[i]) * up[i].
+kernel void silu_mul(
+    device const float* gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    device float*       out  [[buffer(2)]],
+    constant uint&      n    [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    float g = gate[i];
+    out[i] = (g / (1.0f + exp(-g))) * up[i];
+}
+
+// GeGLU (tanh approx): hidden[i] = gelu(gate[i]) * up[i].
+kernel void gelu_mul(
+    device const float* gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    device float*       out  [[buffer(2)]],
+    constant uint&      n    [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    float g = gate[i];
+    const float c = 0.7978845608028654f; // sqrt(2/pi)
+    // Clamp the tanh argument: Metal's tanh computes exp(2x), which overflows to
+    // inf (-> inf/inf = NaN) well before tanh saturates. tanh(+-30) is already
+    // +-1 in f32, so clamping is exact.
+    float arg = clamp(c * (g + 0.044715f * g * g * g), -30.0f, 30.0f);
+    float gelu = 0.5f * g * (1.0f + tanh(arg));
+    out[i] = gelu * up[i];
+}
+
+// Residual add: x[i] += y[i].
+kernel void add_inplace(
+    device float*       x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    constant uint&      n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    x[i] += y[i];
 }
 "#;
 

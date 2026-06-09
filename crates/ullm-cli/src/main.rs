@@ -55,6 +55,9 @@ enum Command {
         /// RNG seed (0 = fixed default).
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Run the forward pass on the Metal GPU.
+        #[arg(long)]
+        gpu: bool,
     },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
@@ -69,6 +72,14 @@ enum Command {
     },
     /// Check the Metal GPU backend and validate a kernel against the CPU.
     MetalCheck,
+    /// Validate the GPU forward pass against the CPU on a real model.
+    GpuCheck {
+        /// Path to a `.gguf` file or HF model directory.
+        path: PathBuf,
+        /// The prompt to run through both backends.
+        #[arg(default_value = "The capital of France is")]
+        prompt: String,
+    },
 }
 
 fn main() {
@@ -85,6 +96,7 @@ fn main() {
             top_k,
             top_p,
             seed,
+            gpu,
         } => run(
             &path,
             &prompt,
@@ -95,6 +107,7 @@ fn main() {
                 top_p,
                 seed,
             },
+            gpu,
         ),
         Command::Serve { path, host, port } => {
             if let Err(e) = ullm_server::run(&path, &host, port) {
@@ -103,7 +116,63 @@ fn main() {
             }
         }
         Command::MetalCheck => metal_check(),
+        Command::GpuCheck { path, prompt } => gpu_check(&path, &prompt),
     }
+}
+
+/// Run a prompt through the CPU and GPU forward passes and compare the logits at
+/// the final position (max abs diff + whether the argmax token agrees).
+fn gpu_check(path: &Path, prompt: &str) {
+    let exit = |e| -> ! {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    };
+    let load = |gpu: bool| -> (ullm_tokenizer::Tokenizer, LlamaModel) {
+        let (tk, mut lm) = if is_safetensors(path) {
+            let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
+            (load_hf_tokenizer(path), LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e)))
+        } else {
+            let m = GgufModel::open(path).unwrap_or_else(|e| exit(e));
+            let tk = m.tokenizer().unwrap_or_else(|e| exit(e));
+            (tk, LlamaModel::from_gguf(&m).unwrap_or_else(|e| exit(e)))
+        };
+        if gpu {
+            lm.enable_gpu().unwrap_or_else(|e| exit(e));
+        }
+        (tk, lm)
+    };
+
+    let (tk, mut cpu) = load(false);
+    let (_, mut gpu) = load(true);
+    let ids = tk.encode(prompt, true);
+
+    if std::env::var("ULLM_GPU_DBG").is_ok() {
+        gpu.gpu_forward_debug(ids[0], 0);
+    }
+
+    let mut cpu_logits = Vec::new();
+    let mut gpu_logits = Vec::new();
+    for (pos, &t) in ids.iter().enumerate() {
+        cpu_logits = cpu.forward(t, pos);
+        gpu_logits = gpu.forward(t, pos);
+    }
+
+    let argmax = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) }).0;
+    let (ca, ga) = (argmax(&cpu_logits), argmax(&gpu_logits));
+    let max_abs = cpu_logits.iter().zip(&gpu_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let scale = cpu_logits.iter().map(|c| c.abs()).fold(1e-6f32, f32::max);
+
+    println!("gpu-check: {path:?}");
+    println!("  tokens:        {}", ids.len());
+    println!("  cpu argmax:    {ca} (logit {:.3})", cpu_logits[ca]);
+    println!("  gpu argmax:    {ga} (logit {:.3})", gpu_logits[ga]);
+    println!("  max |Δlogit|:  {max_abs:.4}  (rel {:.2e})", max_abs / scale);
+    println!(
+        "  decoded next:  cpu={:?}  gpu={:?}",
+        tk.decode(&[ca as u32]),
+        tk.decode(&[ga as u32])
+    );
+    println!("  verdict:       {}", if ca == ga { "ARGMAX MATCH" } else { "MISMATCH" });
 }
 
 fn doctor() {
@@ -316,11 +385,12 @@ fn tokenize(path: &Path, text: &str) {
     println!("decoded:  {:?}", tk.decode(&ids));
 }
 
-fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams) {
+fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams, gpu: bool) {
     let exit = |e| -> ! {
         eprintln!("error: {e}");
         std::process::exit(1);
     };
+    let t_load = std::time::Instant::now();
     let (tk, mut lm) = if is_safetensors(path) {
         let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
         let tk = load_hf_tokenizer(path);
@@ -332,13 +402,31 @@ fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams) {
         let lm = LlamaModel::from_gguf(&model).unwrap_or_else(|e| exit(e));
         (tk, lm)
     };
+    if gpu {
+        lm.enable_gpu().unwrap_or_else(|e| exit(e));
+    }
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     let prompt_ids = tk.encode(prompt, true);
+
+    // Prefill (process the prompt) timed separately from decode.
+    let t_gen = std::time::Instant::now();
     let generated = lm.generate(&prompt_ids, max_tokens, tk.eos_id(), &params);
+    let gen_s = t_gen.elapsed().as_secs_f64();
 
     let mut full = prompt_ids.clone();
     full.extend_from_slice(&generated);
     println!("{}", tk.decode(&full));
+
+    let n = generated.len().max(1);
+    let backend = if lm.gpu_enabled() { "gpu" } else { "cpu" };
+    eprintln!(
+        "\n[perf] {backend} · load {load_ms:.0} ms · {} prompt + {} gen tokens · {:.1} tok/s ({:.1} ms/tok)",
+        prompt_ids.len(),
+        generated.len(),
+        n as f64 / gen_s,
+        gen_s * 1e3 / n as f64,
+    );
 }
 
 fn metal_check() {
