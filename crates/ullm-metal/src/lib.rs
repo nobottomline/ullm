@@ -239,7 +239,7 @@ kernel void matvec_q6k_mr(
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort nsg   [[simdgroups_per_threadgroup]])
 {
-    const short NR0 = 4;
+    const short NR0 = 2;
     uint nb   = in_dim / 256u;
     uint nb01 = nb * 210u;                       // bytes per weight row
     int  first_row = (int)((uint)tgpig * nsg + sgitg) * NR0;
@@ -252,7 +252,7 @@ kernel void matvec_q6k_mr(
     short q_offset_l =  64 * ip + l0;
     short q_offset_h =  32 * ip + l0;
 
-    float sumf[NR0] = { 0.f, 0.f, 0.f, 0.f };
+    float sumf[NR0] = { 0.f, 0.f };
     float yl[16];
 
     device const uchar* x0 = src0 + (uint)first_row * nb01;

@@ -466,7 +466,7 @@ impl GpuForward {
         // simdgroup (activation reuse), the others 1 row per simdgroup.
         const THREADS: u64 = 256;
         let sgs = THREADS / 32;
-        let nr0 = if w.dtype == DType::Q6K { 4 } else { 1 };
+        let nr0 = if w.dtype == DType::Q6K { 2 } else { 1 };
         let groups = (w.out as u64).div_ceil(sgs * nr0);
         enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
     }
