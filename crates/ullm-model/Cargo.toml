@@ -11,3 +11,4 @@ description = "CPU reference runtime (Llama architecture) for the uLLM inference
 [dependencies]
 ullm-core = { workspace = true }
 ullm-gguf = { workspace = true }
+rayon = { workspace = true }

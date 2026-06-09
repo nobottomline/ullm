@@ -4,6 +4,7 @@
 //! readable numerical reference — the oracle the Metal backend will be validated
 //! against — not speed. Quantized weights, batching, and SIMD come later.
 
+use rayon::prelude::*;
 use ullm_core::{Error, Result};
 use ullm_gguf::GgufModel;
 
@@ -250,6 +251,7 @@ fn tensor_f32(model: &GgufModel, name: &str) -> Result<Vec<f32>> {
 /// `y[o] = sum_i w[o*in + i] * x[i]`, with `w` stored row-major as `[out, in]`.
 fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     (0..out_dim)
+        .into_par_iter()
         .map(|o| {
             let row = &w[o * in_dim..o * in_dim + in_dim];
             row.iter().zip(x).map(|(a, b)| a * b).sum()
