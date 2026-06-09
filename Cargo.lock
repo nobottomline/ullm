@@ -897,6 +897,7 @@ name = "ullm-tokenizer"
 version = "0.0.0"
 dependencies = [
  "fancy-regex",
+ "serde_json",
  "ullm-core",
 ]
 

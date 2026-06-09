@@ -259,19 +259,55 @@ fn inspect_safetensors(path: &Path) {
     println!("  first tensors: {sample:?}");
 }
 
-fn tokenize(path: &Path, text: &str) {
-    let model = match GgufModel::open(path) {
+/// Load a tokenizer from a HF directory / `.safetensors` model via its
+/// `tokenizer.json`, reading `bos`/`eos` ids from `config.json`.
+fn load_hf_tokenizer(path: &Path) -> ullm_tokenizer::Tokenizer {
+    let model = match SafeTensorsModel::open(path) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
-    let tk = match model.tokenizer() {
+    let tj = match model.tokenizer_json_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("error: no tokenizer.json next to the model");
+            std::process::exit(1);
+        }
+    };
+    let bytes = std::fs::read(&tj).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let bos = model.config_usize("bos_token_id").map(|v| v as u32);
+    let eos = model.config_usize("eos_token_id").map(|v| v as u32);
+    match ullm_tokenizer::Tokenizer::from_hf_json(&bytes, bos, eos, false) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+fn tokenize(path: &Path, text: &str) {
+    let tk = if is_safetensors(path) {
+        load_hf_tokenizer(path)
+    } else {
+        let model = match GgufModel::open(path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        match model.tokenizer() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
     let ids = tk.encode(text, true);

@@ -30,9 +30,6 @@ impl Tokenizer {
         add_bos: bool,
         pre: &str,
     ) -> Result<Self> {
-        if tokens.is_empty() {
-            return Err(Error::Format("tokenizer has no tokens".into()));
-        }
         let n = tokens.len();
         let types: Vec<TokenType> = (0..n)
             .map(|i| {
@@ -42,9 +39,39 @@ impl Tokenizer {
                     .unwrap_or(TokenType::Normal)
             })
             .collect();
+        // GGUF stores merges as space-separated "A B" strings.
+        let pairs: Vec<(String, String)> = merges
+            .iter()
+            .filter_map(|m| {
+                let mut it = m.splitn(2, ' ');
+                Some((it.next()?.to_string(), it.next()?.to_string()))
+            })
+            .collect();
+        let regex = build_pretokenizer(pre)?;
+        Self::from_bpe_parts(tokens, pairs, types, bos, eos, add_bos, regex)
+    }
+
+    /// Assemble a byte-level BPE tokenizer from already-parsed parts and an
+    /// explicit pre-tokenization regex. Shared by the GGUF and HF-`tokenizer.json`
+    /// constructors.
+    pub(crate) fn from_bpe_parts(
+        tokens: Vec<String>,
+        merge_pairs: Vec<(String, String)>,
+        types: Vec<TokenType>,
+        bos: Option<u32>,
+        eos: Option<u32>,
+        add_bos: bool,
+        regex: fancy_regex::Regex,
+    ) -> Result<Self> {
+        if tokens.is_empty() {
+            return Err(Error::Format("tokenizer has no tokens".into()));
+        }
+        let n = tokens.len();
         let mut token_to_id = HashMap::with_capacity(n);
         for (id, piece) in tokens.iter().enumerate() {
-            token_to_id.entry(piece.clone()).or_insert(id as u32);
+            if !piece.is_empty() {
+                token_to_id.entry(piece.clone()).or_insert(id as u32);
+            }
         }
 
         // GPT-2 byte <-> printable-unicode-char tables.
@@ -58,20 +85,16 @@ impl Tokenizer {
                 .ok_or_else(|| Error::Format(format!("BPE vocab missing base byte char {ch:?}")))?;
         }
 
-        // merges: "A B" -> (rank, merged id).
-        let mut merge_map: HashMap<(u32, u32), (u32, u32)> = HashMap::with_capacity(merges.len());
-        for (rank, m) in merges.iter().enumerate() {
-            let mut it = m.splitn(2, ' ');
-            if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                if let (Some(&la), Some(&rb)) = (token_to_id.get(a), token_to_id.get(b)) {
-                    if let Some(&mid) = token_to_id.get(&format!("{a}{b}")) {
-                        merge_map.entry((la, rb)).or_insert((rank as u32, mid));
-                    }
+        // merge pairs -> (rank, merged id), keyed by the ids of the two sides.
+        let mut merge_map: HashMap<(u32, u32), (u32, u32)> =
+            HashMap::with_capacity(merge_pairs.len());
+        for (rank, (a, b)) in merge_pairs.iter().enumerate() {
+            if let (Some(&la), Some(&rb)) = (token_to_id.get(a), token_to_id.get(b)) {
+                if let Some(&mid) = token_to_id.get(&format!("{a}{b}")) {
+                    merge_map.entry((la, rb)).or_insert((rank as u32, mid));
                 }
             }
         }
-
-        let regex = build_pretokenizer(pre)?;
 
         Ok(Tokenizer {
             tokens,
@@ -151,7 +174,7 @@ impl Tokenizer {
 }
 
 /// GPT-2's reversible byte -> printable-unicode-char mapping.
-fn byte_to_unicode() -> [char; 256] {
+pub(crate) fn byte_to_unicode() -> [char; 256] {
     let mut map = ['\0'; 256];
     let mut assigned = [false; 256];
     for &(lo, hi) in &[(0x21u32, 0x7E), (0xA1, 0xAC), (0xAE, 0xFF)] {

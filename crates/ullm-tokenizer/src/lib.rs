@@ -5,6 +5,7 @@
 //! - **byte-level BPE (GPT-2 style)** — Llama-3 / Qwen / SmolLM family (see [`bpe`]).
 
 mod bpe;
+mod hf;
 mod spm;
 
 use std::collections::HashMap;

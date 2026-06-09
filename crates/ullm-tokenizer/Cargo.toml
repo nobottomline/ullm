@@ -11,3 +11,4 @@ description = "Tokenizers (SentencePiece / byte-level BPE) for the uLLM inferenc
 [dependencies]
 ullm-core = { workspace = true }
 fancy-regex = { workspace = true }
+serde_json = { workspace = true }
