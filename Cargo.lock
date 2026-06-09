@@ -833,6 +833,7 @@ dependencies = [
  "ullm-gguf",
  "ullm-metal",
  "ullm-model",
+ "ullm-safetensors",
  "ullm-server",
  "ullm-tokenizer",
 ]
@@ -865,6 +866,15 @@ dependencies = [
  "rayon",
  "ullm-core",
  "ullm-gguf",
+]
+
+[[package]]
+name = "ullm-safetensors"
+version = "0.0.0"
+dependencies = [
+ "memmap2",
+ "serde_json",
+ "ullm-core",
 ]
 
 [[package]]

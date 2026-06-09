@@ -13,7 +13,7 @@ pub mod value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ullm_core::ir::{ModelSpec, TensorBag, TensorInfo};
+use ullm_core::ir::{ModelSpec, TensorBag, TensorInfo, WeightSource};
 use ullm_core::{DType, Error, Result};
 use ullm_tokenizer::Tokenizer;
 
@@ -318,6 +318,18 @@ impl GgufModel {
     fn i32_array(&self, key: &str) -> Option<Vec<i32>> {
         let arr = self.metadata.get(key).and_then(Value::as_array)?;
         arr.iter().map(|v| v.to_u64().map(|x| x as i32)).collect()
+    }
+}
+
+impl WeightSource for GgufModel {
+    fn tensor_bag(&self) -> &TensorBag {
+        &self.tensors
+    }
+
+    fn tensor_data(&self, name: &str) -> Option<&[u8]> {
+        // Resolves to the inherent method (inherent methods win over trait ones),
+        // so this is not a recursive call.
+        GgufModel::tensor_data(self, name)
     }
 }
 

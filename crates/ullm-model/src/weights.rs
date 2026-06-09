@@ -1,15 +1,15 @@
-//! Loading model weights from GGUF: quantized matrices kept as raw bytes,
-//! norms expanded to f32.
+//! Loading model weights from any [`WeightSource`] (GGUF, SafeTensors):
+//! matrices kept as raw bytes, norms expanded to f32.
 
+use ullm_core::ir::WeightSource;
 use ullm_core::{Error, Result};
-use ullm_gguf::GgufModel;
 
 use crate::QWeight;
 
 /// Load a small tensor (a norm) as a freshly-allocated `f32` vector.
-pub(crate) fn tensor_f32(model: &GgufModel, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn tensor_f32(model: &dyn WeightSource, name: &str) -> Result<Vec<f32>> {
     let info = model
-        .tensors
+        .tensor_bag()
         .get(name)
         .ok_or_else(|| Error::Format(format!("missing tensor '{name}'")))?;
     let n: usize = info.shape.iter().product();
@@ -19,10 +19,10 @@ pub(crate) fn tensor_f32(model: &GgufModel, name: &str) -> Result<Vec<f32>> {
     ullm_core::dequant::dequantize(info.dtype, bytes, n)
 }
 
-/// Load a weight matrix, keeping its quantized bytes (a copy of the mmap slice).
-pub(crate) fn qweight(model: &GgufModel, name: &str) -> Result<QWeight> {
+/// Load a weight matrix, keeping its stored bytes (a copy of the mmap slice).
+pub(crate) fn qweight(model: &dyn WeightSource, name: &str) -> Result<QWeight> {
     let info = model
-        .tensors
+        .tensor_bag()
         .get(name)
         .ok_or_else(|| Error::Format(format!("missing tensor '{name}'")))?;
     let (out, cols) = match info.shape.as_slice() {

@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 ullm-core = { workspace = true }
 ullm-gguf = { workspace = true }
+ullm-safetensors = { workspace = true }
 ullm-tokenizer = { workspace = true }
 ullm-model = { workspace = true }
 ullm-metal = { workspace = true }

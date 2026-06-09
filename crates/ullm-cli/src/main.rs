@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use ullm_core::device::Hardware;
+use ullm_core::ir::WeightSource;
 use ullm_gguf::GgufModel;
 use ullm_metal::MetalContext;
 use ullm_model::{LlamaModel, SampleParams};
+use ullm_safetensors::SafeTensorsModel;
 
 #[derive(Parser)]
 #[command(name = "ullm", version, about = "Universal LLM inference engine")]
@@ -120,7 +122,17 @@ fn doctor() {
     );
 }
 
+/// Whether `path` is a Hugging Face / SafeTensors model (a directory or a
+/// `.safetensors` file) rather than a GGUF file.
+fn is_safetensors(path: &Path) -> bool {
+    path.is_dir() || path.extension().is_some_and(|e| e == "safetensors")
+}
+
 fn inspect(path: &Path) {
+    if is_safetensors(path) {
+        inspect_safetensors(path);
+        return;
+    }
     let model = match GgufModel::open(path) {
         Ok(m) => m,
         Err(e) => {
@@ -180,6 +192,71 @@ fn inspect(path: &Path) {
         let sample: Vec<&str> = toks.iter().take(14).filter_map(|v| v.as_str()).collect();
         println!("  first tokens:  {sample:?}");
     }
+}
+
+fn inspect_safetensors(path: &Path) {
+    let model = match SafeTensorsModel::open(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("safetensors: {}", path.display());
+    let arch = model
+        .config()
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .or_else(|| model.config_str("model_type"))
+        .unwrap_or("<unknown>");
+    println!("  architecture:  {arch}");
+    let field = |k: &str| model.config_usize(k);
+    if let Some(v) = field("hidden_size") {
+        println!("  hidden size:   {v}");
+    }
+    if let Some(v) = field("num_hidden_layers") {
+        println!("  layers:        {v}");
+    }
+    let heads = field("num_attention_heads");
+    let kv = field("num_key_value_heads").or(heads);
+    if let (Some(h), Some(k)) = (heads, kv) {
+        println!("  heads:         {h} (kv {k})");
+    }
+    if let Some(v) = field("head_dim") {
+        println!("  head dim:      {v}");
+    }
+    if let Some(v) = field("intermediate_size") {
+        println!("  ffn:           {v}");
+    }
+    if let Some(v) = field("vocab_size") {
+        println!("  vocab:         {v}");
+    }
+    if let Some(v) = field("max_position_embeddings") {
+        println!("  context len:   {v}");
+    }
+    if let Some(v) = model.config_f32("rope_theta") {
+        println!("  rope theta:    {v}");
+    }
+    println!("  tensors:       {}", model.tensor_bag().len());
+
+    let mut dtypes: BTreeMap<String, usize> = BTreeMap::new();
+    for t in model.tensor_bag().tensors.values() {
+        *dtypes.entry(format!("{:?}", t.dtype)).or_default() += 1;
+    }
+    println!("  dtypes:        {dtypes:?}");
+    println!(
+        "  tokenizer.json: {}",
+        model
+            .tokenizer_json_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".into())
+    );
+    let mut names: Vec<&String> = model.tensor_bag().tensors.keys().collect();
+    names.sort();
+    let sample: Vec<&String> = names.into_iter().take(6).collect();
+    println!("  first tensors: {sample:?}");
 }
 
 fn tokenize(path: &Path, text: &str) {

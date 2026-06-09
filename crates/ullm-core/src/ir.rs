@@ -56,6 +56,18 @@ impl TensorBag {
     }
 }
 
+/// A loaded model container that yields tensor bytes by canonical name.
+///
+/// Implemented by every loader (GGUF, SafeTensors, …) so the runtime can build a
+/// model from any container without branching on the file format.
+pub trait WeightSource {
+    /// The container's tensor directory (names, dtypes, shapes).
+    fn tensor_bag(&self) -> &TensorBag;
+
+    /// Raw bytes of one tensor's data, exactly as stored (possibly quantized).
+    fn tensor_data(&self, name: &str) -> Option<&[u8]>;
+}
+
 /// Normalized model description, independent of the source file format.
 #[derive(Debug, Default, Clone)]
 pub struct ModelSpec {
