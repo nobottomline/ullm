@@ -2,13 +2,25 @@
 
 use rayon::prelude::*;
 
-use crate::QWeight;
+use crate::{MlxQuant, QWeight};
 
 /// `y[o] = sum_i W[o, i] * x[i]`, dequantizing each row of `w` on the fly into a
 /// per-thread reused buffer. Memory-bound work, parallel over output rows.
 pub(crate) fn matvec_q(w: &QWeight, x: &[f32]) -> Vec<f32> {
-    let rb = w.row_bytes();
     let cols = w.cols;
+    if let Some(mlx) = &w.mlx {
+        return (0..w.out)
+            .into_par_iter()
+            .map_init(
+                || vec![0.0f32; cols],
+                |buf, o| {
+                    dequant_mlx_row(&w.data, mlx, o, cols, buf);
+                    buf.iter().zip(x).map(|(a, b)| a * b).sum()
+                },
+            )
+            .collect();
+    }
+    let rb = w.row_bytes();
     (0..w.out)
         .into_par_iter()
         .map_init(
@@ -20,6 +32,22 @@ pub(crate) fn matvec_q(w: &QWeight, x: &[f32]) -> Vec<f32> {
             },
         )
         .collect()
+}
+
+/// Dequantize one row of an MLX 4-bit weight (`[out, cols]`, eight 4-bit values
+/// per u32, LSB first; one scale/bias per `group_size`) into `buf`.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn dequant_mlx_row(data: &[u8], mlx: &MlxQuant, o: usize, cols: usize, buf: &mut [f32]) {
+    let words = cols / 8;
+    let groups = cols / mlx.group_size;
+    let base = o * words * 4;
+    for i in 0..cols {
+        let wb = base + (i / 8) * 4;
+        let word = u32::from_le_bytes([data[wb], data[wb + 1], data[wb + 2], data[wb + 3]]);
+        let q = (word >> ((i % 8) * 4)) & 0xF;
+        let g = o * groups + i / mlx.group_size;
+        buf[i] = q as f32 * mlx.scales[g] + mlx.biases[g];
+    }
 }
 
 /// RMS normalization with a learned per-channel gain.
@@ -128,6 +156,7 @@ mod tests {
             dtype: DType::F32,
             out: 2,
             cols: 2,
+            mlx: None,
         };
         assert_eq!(matvec_q(&w, &[3.0, 5.0]), vec![3.0, 5.0]);
     }

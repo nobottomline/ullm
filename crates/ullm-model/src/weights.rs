@@ -43,5 +43,6 @@ pub(crate) fn qweight(model: &dyn WeightSource, name: &str) -> Result<QWeight> {
         dtype: info.dtype,
         out,
         cols,
+        mlx: None,
     })
 }

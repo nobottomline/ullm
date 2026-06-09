@@ -19,18 +19,29 @@ use ullm_safetensors::SafeTensorsModel;
 pub use config::{Arch, LlamaConfig};
 pub use sample::SampleParams;
 
-use math::{add_bias, gelu, matvec_q, rmsnorm, rope, rope_neox, silu, softmax};
+use math::{add_bias, dequant_mlx_row, gelu, matvec_q, rmsnorm, rope, rope_neox, silu, softmax};
 use sample::sample_token;
 use weights::{qweight, tensor_f32};
 
-/// A weight matrix kept in its quantized GGUF form (`[out, cols]`, row-major).
-/// Rows are dequantized on demand during the matmul.
+/// Side tables for an MLX 4-bit weight kept resident (group scale + bias),
+/// instead of pre-dequantizing it to a wider type.
+#[derive(Clone)]
+struct MlxQuant {
+    scales: Vec<f32>,
+    biases: Vec<f32>,
+    group_size: usize,
+}
+
+/// A weight matrix kept in its quantized form (`[out, cols]`, row-major). Rows
+/// are dequantized on demand during the matmul. `mlx` is set for MLX 4-bit
+/// weights (whose scales/biases live in separate tensors).
 #[derive(Clone)]
 struct QWeight {
     data: Vec<u8>,
     dtype: DType,
     out: usize,
     cols: usize,
+    mlx: Option<MlxQuant>,
 }
 
 impl QWeight {
@@ -345,11 +356,15 @@ impl LlamaModel {
     /// The (already scaled, for Gemma) input embedding for `token`.
     fn embed(&self, token: u32) -> Vec<f32> {
         let w = &self.tok_embeddings;
-        let rb = w.row_bytes();
         let o = token as usize;
         let mut x = vec![0.0f32; self.config.n_embd];
-        ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], &mut x)
-            .expect("dequantize embedding row");
+        if let Some(mlx) = &w.mlx {
+            dequant_mlx_row(&w.data, mlx, o, w.cols, &mut x);
+        } else {
+            let rb = w.row_bytes();
+            ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], &mut x)
+                .expect("dequantize embedding row");
+        }
         if self.config.arch == Arch::Gemma3 {
             let s = (self.config.n_embd as f32).sqrt();
             for xi in &mut x {
@@ -426,7 +441,6 @@ impl LlamaModel {
     fn forward_llama(&mut self, token: u32, pos: usize) -> Vec<f32> {
         let use_neox = self.rope_neox;
         let c = &self.config;
-        let dim = c.n_embd;
         let head_dim = c.head_dim;
         let kv_dim = c.n_kv_head * head_dim;
         let q_dim = c.n_head * head_dim;
@@ -439,14 +453,7 @@ impl LlamaModel {
         let rope_theta = c.rope_theta;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let mut x = vec![0.0f32; dim];
-        {
-            let w = &self.tok_embeddings;
-            let rb = w.row_bytes();
-            let o = token as usize;
-            ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], &mut x)
-                .expect("dequantize embedding row");
-        }
+        let mut x = self.embed(token);
 
         for l in 0..n_layer {
             let lw = &self.layers[l];
@@ -548,7 +555,6 @@ impl LlamaModel {
     /// window attention is treated as full attention (correct for short context).
     fn forward_gemma(&mut self, token: u32, pos: usize) -> Vec<f32> {
         let c = &self.config;
-        let dim = c.n_embd;
         let head_dim = c.head_dim;
         let kv_dim = c.n_kv_head * head_dim;
         let q_dim = c.n_head * head_dim;
@@ -561,19 +567,8 @@ impl LlamaModel {
         let rope_theta = c.rope_theta;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let mut x = vec![0.0f32; dim];
-        {
-            let w = &self.tok_embeddings;
-            let rb = w.row_bytes();
-            let o = token as usize;
-            ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], &mut x)
-                .expect("dequantize embedding row");
-        }
-        // Gemma scales the input embeddings by sqrt(n_embd).
-        let emb_scale = (dim as f32).sqrt();
-        for xi in x.iter_mut() {
-            *xi *= emb_scale;
-        }
+        // Embedding (with Gemma's sqrt(n_embd) scale) is computed in `embed`.
+        let mut x = self.embed(token);
 
         for l in 0..n_layer {
             let lw = &self.layers[l];
