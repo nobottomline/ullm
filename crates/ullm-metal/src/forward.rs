@@ -112,6 +112,8 @@ pub struct GpuForward {
     queue: CommandQueue,
     // pipelines
     p_matvec_f32: ComputePipelineState,
+    p_matvec_f16: ComputePipelineState,
+    p_matvec_bf16: ComputePipelineState,
     p_matvec_q4k: ComputePipelineState,
     p_matvec_q6k: ComputePipelineState,
     p_rmsnorm: ComputePipelineState,
@@ -215,6 +217,8 @@ impl GpuForward {
 
         Ok(Self {
             p_matvec_f32: pso("matvec_f32_sg")?,
+            p_matvec_f16: pso("matvec_f16_mr")?,
+            p_matvec_bf16: pso("matvec_bf16_mr")?,
             p_matvec_q4k: pso("matvec_q4k_sg")?,
             p_matvec_q6k: pso("matvec_q6k_mr")?,
             p_rmsnorm: pso("rmsnorm")?,
@@ -251,6 +255,8 @@ impl GpuForward {
     fn pso_matvec(&self, dtype: DType) -> Result<&ComputePipelineState> {
         match dtype {
             DType::F32 => Ok(&self.p_matvec_f32),
+            DType::F16 => Ok(&self.p_matvec_f16),
+            DType::BF16 => Ok(&self.p_matvec_bf16),
             DType::Q4K => Ok(&self.p_matvec_q4k),
             DType::Q6K => Ok(&self.p_matvec_q6k),
             other => Err(Error::Unsupported(format!(
@@ -466,7 +472,10 @@ impl GpuForward {
         // simdgroup (activation reuse), the others 1 row per simdgroup.
         const THREADS: u64 = 256;
         let sgs = THREADS / 32;
-        let nr0 = if w.dtype == DType::Q6K { 2 } else { 1 };
+        let nr0 = match w.dtype {
+            DType::Q6K | DType::BF16 | DType::F16 => 2,
+            _ => 1,
+        };
         let groups = (w.out as u64).div_ceil(sgs * nr0);
         enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
     }

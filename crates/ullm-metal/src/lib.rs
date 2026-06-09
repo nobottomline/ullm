@@ -289,6 +289,65 @@ kernel void matvec_q6k_mr(
     }
 }
 
+// Multi-row BF16 matvec (for SafeTensors / HF weights). bf16 is the top 16 bits
+// of an f32, so dequant is a 16-bit left shift. Lanes stride the in_dim with
+// coalesced reads; each simdgroup does NR0 rows, reusing each activation.
+kernel void matvec_bf16_mr(
+    device const ushort* src0    [[buffer(0)]],
+    device const float*  src1    [[buffer(1)]],
+    device float*        dst     [[buffer(2)]],
+    constant uint&       in_dim  [[buffer(3)]],
+    constant uint&       out_dim [[buffer(4)]],
+    uint   tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const short NR0 = 2;
+    int first_row = (int)((uint)tgpig * nsg + sgitg) * NR0;
+    float sumf[NR0] = { 0.f, 0.f };
+    for (uint i = tiisg; i < in_dim; i += 32u) {
+        float xi = src1[i];
+        for (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)out_dim) break;
+            ushort wb = src0[(uint)(first_row + row) * in_dim + i];
+            sumf[row] += as_type<float>((uint)wb << 16) * xi;
+        }
+    }
+    for (short row = 0; row < NR0; ++row) {
+        float s = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < (int)out_dim) dst[first_row + row] = s;
+    }
+}
+
+// Multi-row F16 matvec (same layout, half -> float).
+kernel void matvec_f16_mr(
+    device const half*  src0    [[buffer(0)]],
+    device const float* src1    [[buffer(1)]],
+    device float*       dst     [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint   tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const short NR0 = 2;
+    int first_row = (int)((uint)tgpig * nsg + sgitg) * NR0;
+    float sumf[NR0] = { 0.f, 0.f };
+    for (uint i = tiisg; i < in_dim; i += 32u) {
+        float xi = src1[i];
+        for (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)out_dim) break;
+            sumf[row] += (float)src0[(uint)(first_row + row) * in_dim + i] * xi;
+        }
+    }
+    for (short row = 0; row < NR0; ++row) {
+        float s = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < (int)out_dim) dst[first_row + row] = s;
+    }
+}
+
 // ---- Full-forward kernels (activations resident on the GPU) ----
 
 // RMSNorm over `n` elements with a per-channel gain. `y` may alias `x`.
