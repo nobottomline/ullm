@@ -54,8 +54,17 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
-    /// Start an OpenAI-compatible server (not yet implemented).
-    Serve,
+    /// Start an OpenAI-compatible HTTP server.
+    Serve {
+        /// Path to a `.gguf` model file.
+        path: PathBuf,
+        /// Host / interface to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
     /// Check the Metal GPU backend and validate a kernel against the CPU.
     MetalCheck,
 }
@@ -85,9 +94,11 @@ fn main() {
                 seed,
             },
         ),
-        Command::Serve => {
-            eprintln!("not yet implemented — see docs/roadmap.md (Phase 0)");
-            std::process::exit(1);
+        Command::Serve { path, host, port } => {
+            if let Err(e) = ullm_server::run(&path, &host, port) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
         Command::MetalCheck => metal_check(),
     }
