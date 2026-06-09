@@ -23,7 +23,7 @@ commands below rather than trusting the table blindly.
 | Llama-3.2-1B | Q4_K_M | ~0.8 GiB | — | **263 t/s** | — |
 | Qwen2.5-1.5B | Q4_K_M | ~1.0 GiB | — | **190 t/s** | — |
 | Qwen3-4B-Instruct | BF16 (HF) | ~8 GiB | ~1 t/s | **26.6 t/s** | n/a¹ |
-| Qwen3-Coder-30B-A3B | MLX 4-bit (MoE) | ~16 GiB | 0.9 t/s | **22.7 t/s** | n/a¹ |
+| Qwen3-Coder-30B-A3B | MLX 4-bit (MoE) | ~16 GiB | 0.9 t/s | **32.5 t/s** | n/a¹ |
 
 ¹ BF16 SafeTensors / MLX is read directly (no GGUF conversion); llama.cpp can't
 load it without converting/quantizing first.
