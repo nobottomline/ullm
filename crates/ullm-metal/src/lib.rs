@@ -542,6 +542,113 @@ kernel void moe_gate_up(
     }
 }
 
+// All-experts fused gate+up+activation. 2D grid (rows x k): tgpig.y = slot,
+// computing hidden[slot*out_dim + o] for every selected expert in one dispatch.
+kernel void moe_gate_up_all(
+    device const uint*  wg         [[buffer(0)]],
+    device const uint*  wu         [[buffer(1)]],
+    device const float* x          [[buffer(2)]],
+    device float*       hidden     [[buffer(3)]],
+    device const float* sg         [[buffer(4)]],
+    device const float* bg         [[buffer(5)]],
+    device const float* su         [[buffer(6)]],
+    device const float* bu         [[buffer(7)]],
+    constant uint&      in_dim     [[buffer(8)]],
+    constant uint&      out_dim    [[buffer(9)]],
+    constant uint&      group_size [[buffer(10)]],
+    device const uint*  eidx       [[buffer(11)]],
+    constant uint&      geglu      [[buffer(12)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort sgi   [[simdgroup_index_in_threadgroup]],
+    ushort sgs   [[simdgroups_per_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]])
+{
+    uint o = tgpig.x * sgs + sgi;
+    if (o >= out_dim) return;
+    uint slot = tgpig.y;
+    uint e = eidx[slot];
+    uint words = in_dim / 8u, groups = in_dim / group_size;
+    ulong base = ((ulong)e * out_dim + o);
+    device const uint*  rg  = wg + base * words;
+    device const uint*  ru  = wu + base * words;
+    device const float* sgr = sg + base * groups;
+    device const float* bgr = bg + base * groups;
+    device const float* sur = su + base * groups;
+    device const float* bur = bu + base * groups;
+    float ag = 0.0f, au = 0.0f;
+    for (uint i = lane; i < in_dim; i += 32u) {
+        uint gi = i / group_size, sh = (i % 8u) * 4u;
+        float xi = x[i];
+        ag += ((float)((rg[i / 8u] >> sh) & 0xFu) * sgr[gi] + bgr[gi]) * xi;
+        au += ((float)((ru[i / 8u] >> sh) & 0xFu) * sur[gi] + bur[gi]) * xi;
+    }
+    ag = simd_sum(ag);
+    au = simd_sum(au);
+    if (lane == 0) {
+        float act;
+        if (geglu != 0u) {
+            const float c = 0.7978845608028654f;
+            float arg = clamp(c * (ag + 0.044715f * ag * ag * ag), -30.0f, 30.0f);
+            act = 0.5f * ag * (1.0f + tanh(arg));
+        } else {
+            act = ag / (1.0f + exp(-ag));
+        }
+        hidden[(ulong)slot * out_dim + o] = act * au;
+    }
+}
+
+// All-experts down projection. 2D grid (rows x k): out[slot*out_dim + o] =
+// W_down[eidx[slot]][o] · hidden[slot].
+kernel void moe_down_all(
+    device const uint*  wd         [[buffer(0)]],
+    device const float* hidden     [[buffer(1)]],
+    device float*       out        [[buffer(2)]],
+    device const float* sd         [[buffer(3)]],
+    device const float* bd         [[buffer(4)]],
+    constant uint&      in_dim     [[buffer(5)]],
+    constant uint&      out_dim    [[buffer(6)]],
+    constant uint&      group_size [[buffer(7)]],
+    device const uint*  eidx       [[buffer(8)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort sgi   [[simdgroup_index_in_threadgroup]],
+    ushort sgs   [[simdgroups_per_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]])
+{
+    uint o = tgpig.x * sgs + sgi;
+    if (o >= out_dim) return;
+    uint slot = tgpig.y;
+    uint e = eidx[slot];
+    uint words = in_dim / 8u, groups = in_dim / group_size;
+    ulong base = ((ulong)e * out_dim + o);
+    device const uint*  row  = wd + base * words;
+    device const float* srow = sd + base * groups;
+    device const float* brow = bd + base * groups;
+    device const float* h    = hidden + (ulong)slot * in_dim;
+    float acc = 0.0f;
+    for (uint i = lane; i < in_dim; i += 32u) {
+        uint gi = i / group_size;
+        uint q = (row[i / 8u] >> ((i % 8u) * 4u)) & 0xFu;
+        acc += ((float)q * srow[gi] + brow[gi]) * h[i];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)slot * out_dim + o] = acc;
+}
+
+// Combine the experts' down outputs: xb2[o] = sum_slot wts[slot] * down[slot,o].
+kernel void moe_combine(
+    device const float* down [[buffer(0)]],
+    device const float* wts  [[buffer(1)]],
+    device float*       xb2  [[buffer(2)]],
+    constant uint&      n    [[buffer(3)]],
+    constant uint&      k    [[buffer(4)]],
+    uint o [[thread_position_in_grid]])
+{
+    if (o >= n) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < k; ++s) acc += wts[s] * down[(ulong)s * n + o];
+    xb2[o] = acc;
+}
+
 // Multi-row BF16 matvec (for SafeTensors / HF weights). bf16 is the top 16 bits
 // of an f32, so dequant is a 16-bit left shift. Lanes stride the in_dim with
 // coalesced reads; each simdgroup does NR0 rows, reusing each activation.

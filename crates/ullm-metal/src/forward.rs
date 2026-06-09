@@ -176,9 +176,10 @@ pub struct GpuForward {
     p_gelu_mul: ComputePipelineState,
     p_add: ComputePipelineState,
     p_matvec_mlx4: ComputePipelineState,
-    p_matvec_mlx4_id: ComputePipelineState,
     p_moe_topk: ComputePipelineState,
-    p_moe_gate_up: ComputePipelineState,
+    p_moe_gate_up_all: ComputePipelineState,
+    p_moe_down_all: ComputePipelineState,
+    p_moe_combine: ComputePipelineState,
     // config
     p: GpuParams,
     // weights
@@ -198,10 +199,12 @@ pub struct GpuForward {
     logits: Buffer,
     key_cache: Buffer,
     val_cache: Buffer,
-    // MoE scratch (allocated even for dense models; tiny)
+    // MoE scratch (allocated even for dense models)
     moe_logits: Buffer,
     moe_idx: Buffer,
     moe_wts: Buffer,
+    moe_hidden: Buffer, // [n_experts_used * moe_inter]
+    moe_down: Buffer,   // [n_experts_used * n_embd]
 }
 
 // SAFETY: the Metal handles are only ever touched while decoding a single token,
@@ -313,9 +316,10 @@ impl GpuForward {
             p_gelu_mul: pso("gelu_mul")?,
             p_add: pso("add_inplace")?,
             p_matvec_mlx4: pso("matvec_mlx4")?,
-            p_matvec_mlx4_id: pso("matvec_mlx4_id")?,
             p_moe_topk: pso("moe_topk")?,
-            p_moe_gate_up: pso("moe_gate_up")?,
+            p_moe_gate_up_all: pso("moe_gate_up_all")?,
+            p_moe_down_all: pso("moe_down_all")?,
+            p_moe_combine: pso("moe_combine")?,
             output: wbuf(&input.output),
             final_norm: upload_f32(input.final_norm),
             layers,
@@ -334,6 +338,8 @@ impl GpuForward {
             moe_logits: alloc(p.n_experts.max(1)),
             moe_idx: alloc(p.n_experts_used.max(1)),
             moe_wts: alloc(p.n_experts_used.max(1)),
+            moe_hidden: alloc((p.n_experts_used * p.moe_inter).max(1)),
+            moe_down: alloc((p.n_experts_used * p.n_embd).max(1)),
             queue,
             p,
         })
@@ -434,16 +440,13 @@ impl GpuForward {
                 // router logits -> top-k -> weighted sum of selected experts in xb2
                 self.matvec(enc, gate_w, &self.xb, &self.moe_logits, 0);
                 self.moe_topk(enc);
+                // All k experts in 3 dispatches: gate+up+act -> down -> combine.
                 let eg = lw.experts_gate.as_ref().unwrap();
                 let eu = lw.experts_up.as_ref().unwrap();
                 let ed = lw.experts_down.as_ref().unwrap();
-                let geglu = u32::from(p.geglu);
-                for slot in 0..p.n_experts_used as u32 {
-                    // fused gate+up+activation -> hidden, then weighted down -> xb2
-                    self.moe_gate_up(enc, eg, eu, &self.xb, slot, geglu);
-                    let mode = if slot == 0 { 1 } else { 2 };
-                    self.matvec_id(enc, ed, &self.hidden, &self.xb2, slot, mode);
-                }
+                self.moe_gate_up_all(enc, eg, eu, &self.xb);
+                self.moe_down_all(enc, ed);
+                self.moe_combine(enc);
             } else {
                 self.matvec(enc, &lw.w_gate, &self.xb, &self.gate, 0);
                 self.matvec(enc, &lw.w_up, &self.xb, &self.up, 0);
@@ -598,53 +601,14 @@ impl GpuForward {
         enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
     }
 
-    /// Expert-indexed MLX 4-bit matvec: `y = ewts[slot]^? * (W[idx[slot]] · x)`,
-    /// `mode` controls write/init-accumulate/accumulate (see the kernel).
-    #[allow(clippy::too_many_arguments)]
-    fn matvec_id(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        e: &EBuf,
-        x: &Buffer,
-        y: &Buffer,
-        slot: u32,
-        mode: u32,
-    ) {
-        enc.set_compute_pipeline_state(&self.p_matvec_mlx4_id);
-        enc.set_buffer(0, Some(&e.buf), 0);
-        enc.set_buffer(1, Some(x), 0);
-        enc.set_buffer(2, Some(y), 0);
-        enc.set_buffer(3, Some(&e.scales), 0);
-        enc.set_buffer(4, Some(&e.biases), 0);
-        let (in_dim, out_dim) = (e.cols as u32, e.out as u32);
-        enc.set_bytes(5, 4, (&in_dim as *const u32).cast());
-        enc.set_bytes(6, 4, (&out_dim as *const u32).cast());
-        enc.set_bytes(7, 4, (&e.group as *const u32).cast());
-        enc.set_buffer(8, Some(&self.moe_idx), 0);
-        enc.set_buffer(9, Some(&self.moe_wts), 0);
-        enc.set_bytes(10, 4, (&slot as *const u32).cast());
-        enc.set_bytes(11, 4, (&mode as *const u32).cast());
-        const THREADS: u64 = 256;
-        let groups = (e.out as u64).div_ceil(THREADS / 32);
-        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
-    }
-
-    /// Fused MoE gate+up+activation for the expert in `moe_idx[slot]`: writes
-    /// `hidden = act(gate·x) * (up·x)` in one dispatch.
-    fn moe_gate_up(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        eg: &EBuf,
-        eu: &EBuf,
-        x: &Buffer,
-        slot: u32,
-        geglu: u32,
-    ) {
-        enc.set_compute_pipeline_state(&self.p_moe_gate_up);
+    /// All-experts fused gate+up+activation: one 2D dispatch over (rows x k)
+    /// fills `moe_hidden[slot*moe_inter + o]` for every selected expert.
+    fn moe_gate_up_all(&self, enc: &ComputeCommandEncoderRef, eg: &EBuf, eu: &EBuf, x: &Buffer) {
+        enc.set_compute_pipeline_state(&self.p_moe_gate_up_all);
         enc.set_buffer(0, Some(&eg.buf), 0);
         enc.set_buffer(1, Some(&eu.buf), 0);
         enc.set_buffer(2, Some(x), 0);
-        enc.set_buffer(3, Some(&self.hidden), 0);
+        enc.set_buffer(3, Some(&self.moe_hidden), 0);
         enc.set_buffer(4, Some(&eg.scales), 0);
         enc.set_buffer(5, Some(&eg.biases), 0);
         enc.set_buffer(6, Some(&eu.scales), 0);
@@ -654,11 +618,44 @@ impl GpuForward {
         enc.set_bytes(9, 4, (&out_dim as *const u32).cast());
         enc.set_bytes(10, 4, (&eg.group as *const u32).cast());
         enc.set_buffer(11, Some(&self.moe_idx), 0);
-        enc.set_bytes(12, 4, (&slot as *const u32).cast());
-        enc.set_bytes(13, 4, (&geglu as *const u32).cast());
+        let geglu = u32::from(self.p.geglu);
+        enc.set_bytes(12, 4, (&geglu as *const u32).cast());
         const THREADS: u64 = 256;
-        let groups = (eg.out as u64).div_ceil(THREADS / 32);
-        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
+        let gx = (eg.out as u64).div_ceil(THREADS / 32);
+        let k = self.p.n_experts_used as u64;
+        enc.dispatch_thread_groups(MTLSize::new(gx, k, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
+    /// All-experts down projection: `moe_down[slot*n_embd + o] = W_down · hidden`.
+    fn moe_down_all(&self, enc: &ComputeCommandEncoderRef, ed: &EBuf) {
+        enc.set_compute_pipeline_state(&self.p_moe_down_all);
+        enc.set_buffer(0, Some(&ed.buf), 0);
+        enc.set_buffer(1, Some(&self.moe_hidden), 0);
+        enc.set_buffer(2, Some(&self.moe_down), 0);
+        enc.set_buffer(3, Some(&ed.scales), 0);
+        enc.set_buffer(4, Some(&ed.biases), 0);
+        let (in_dim, out_dim) = (ed.cols as u32, ed.out as u32);
+        enc.set_bytes(5, 4, (&in_dim as *const u32).cast());
+        enc.set_bytes(6, 4, (&out_dim as *const u32).cast());
+        enc.set_bytes(7, 4, (&ed.group as *const u32).cast());
+        enc.set_buffer(8, Some(&self.moe_idx), 0);
+        const THREADS: u64 = 256;
+        let gx = (ed.out as u64).div_ceil(THREADS / 32);
+        let k = self.p.n_experts_used as u64;
+        enc.dispatch_thread_groups(MTLSize::new(gx, k, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
+    /// Combine the experts' down outputs into `xb2` with the router weights.
+    fn moe_combine(&self, enc: &ComputeCommandEncoderRef) {
+        enc.set_compute_pipeline_state(&self.p_moe_combine);
+        enc.set_buffer(0, Some(&self.moe_down), 0);
+        enc.set_buffer(1, Some(&self.moe_wts), 0);
+        enc.set_buffer(2, Some(&self.xb2), 0);
+        let n = self.p.n_embd as u32;
+        let k = self.p.n_experts_used as u32;
+        enc.set_bytes(3, 4, (&n as *const u32).cast());
+        enc.set_bytes(4, 4, (&k as *const u32).cast());
+        dispatch_1d(enc, &self.p_moe_combine, self.p.n_embd as u64);
     }
 
     /// Router top-k + softmax: fills `moe_idx`/`moe_wts` from `moe_logits`.
