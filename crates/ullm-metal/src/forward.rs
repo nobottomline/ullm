@@ -178,6 +178,7 @@ pub struct GpuForward {
     p_matvec_mlx4: ComputePipelineState,
     p_matvec_mlx4_id: ComputePipelineState,
     p_moe_topk: ComputePipelineState,
+    p_moe_gate_up: ComputePipelineState,
     // config
     p: GpuParams,
     // weights
@@ -314,6 +315,7 @@ impl GpuForward {
             p_matvec_mlx4: pso("matvec_mlx4")?,
             p_matvec_mlx4_id: pso("matvec_mlx4_id")?,
             p_moe_topk: pso("moe_topk")?,
+            p_moe_gate_up: pso("moe_gate_up")?,
             output: wbuf(&input.output),
             final_norm: upload_f32(input.final_norm),
             layers,
@@ -435,10 +437,10 @@ impl GpuForward {
                 let eg = lw.experts_gate.as_ref().unwrap();
                 let eu = lw.experts_up.as_ref().unwrap();
                 let ed = lw.experts_down.as_ref().unwrap();
+                let geglu = u32::from(p.geglu);
                 for slot in 0..p.n_experts_used as u32 {
-                    self.matvec_id(enc, eg, &self.xb, &self.gate, slot, 0);
-                    self.matvec_id(enc, eu, &self.xb, &self.up, slot, 0);
-                    self.glu(enc, ffn_pso, p.moe_inter);
+                    // fused gate+up+activation -> hidden, then weighted down -> xb2
+                    self.moe_gate_up(enc, eg, eu, &self.xb, slot, geglu);
                     let mode = if slot == 0 { 1 } else { 2 };
                     self.matvec_id(enc, ed, &self.hidden, &self.xb2, slot, mode);
                 }
@@ -624,6 +626,38 @@ impl GpuForward {
         enc.set_bytes(11, 4, (&mode as *const u32).cast());
         const THREADS: u64 = 256;
         let groups = (e.out as u64).div_ceil(THREADS / 32);
+        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
+    /// Fused MoE gate+up+activation for the expert in `moe_idx[slot]`: writes
+    /// `hidden = act(gate·x) * (up·x)` in one dispatch.
+    fn moe_gate_up(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        eg: &EBuf,
+        eu: &EBuf,
+        x: &Buffer,
+        slot: u32,
+        geglu: u32,
+    ) {
+        enc.set_compute_pipeline_state(&self.p_moe_gate_up);
+        enc.set_buffer(0, Some(&eg.buf), 0);
+        enc.set_buffer(1, Some(&eu.buf), 0);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(&self.hidden), 0);
+        enc.set_buffer(4, Some(&eg.scales), 0);
+        enc.set_buffer(5, Some(&eg.biases), 0);
+        enc.set_buffer(6, Some(&eu.scales), 0);
+        enc.set_buffer(7, Some(&eu.biases), 0);
+        let (in_dim, out_dim) = (eg.cols as u32, eg.out as u32);
+        enc.set_bytes(8, 4, (&in_dim as *const u32).cast());
+        enc.set_bytes(9, 4, (&out_dim as *const u32).cast());
+        enc.set_bytes(10, 4, (&eg.group as *const u32).cast());
+        enc.set_buffer(11, Some(&self.moe_idx), 0);
+        enc.set_bytes(12, 4, (&slot as *const u32).cast());
+        enc.set_bytes(13, 4, (&geglu as *const u32).cast());
+        const THREADS: u64 = 256;
+        let groups = (eg.out as u64).div_ceil(THREADS / 32);
         enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
     }
 

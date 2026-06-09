@@ -482,6 +482,66 @@ kernel void matvec_mlx4_id(
     }
 }
 
+// Fused MoE gate+up+activation for one selected expert: in one dispatch it does
+// both projections of `x` and writes hidden = act(gate·x) * (up·x). Halves the
+// expert FFN dispatch count vs separate gate/up/glu kernels. geglu != 0 -> GeGLU.
+kernel void moe_gate_up(
+    device const uint*  wg         [[buffer(0)]],
+    device const uint*  wu         [[buffer(1)]],
+    device const float* x          [[buffer(2)]],
+    device float*       hidden     [[buffer(3)]],
+    device const float* sg         [[buffer(4)]],
+    device const float* bg         [[buffer(5)]],
+    device const float* su         [[buffer(6)]],
+    device const float* bu         [[buffer(7)]],
+    constant uint&      in_dim     [[buffer(8)]],
+    constant uint&      out_dim    [[buffer(9)]],
+    constant uint&      group_size [[buffer(10)]],
+    device const uint*  eidx       [[buffer(11)]],
+    constant uint&      slot       [[buffer(12)]],
+    constant uint&      geglu      [[buffer(13)]],
+    uint   tg   [[threadgroup_position_in_grid]],
+    ushort sgi  [[simdgroup_index_in_threadgroup]],
+    ushort sgs  [[simdgroups_per_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    uint o = (uint)tg * sgs + sgi;
+    if (o >= out_dim) return;                 // o is uniform across the simdgroup
+    uint e = eidx[slot];
+    uint words  = in_dim / 8u;
+    uint groups = in_dim / group_size;
+    ulong base = ((ulong)e * out_dim + o);
+    device const uint*  rg  = wg + base * words;
+    device const uint*  ru  = wu + base * words;
+    device const float* sgr = sg + base * groups;
+    device const float* bgr = bg + base * groups;
+    device const float* sur = su + base * groups;
+    device const float* bur = bu + base * groups;
+    float ag = 0.0f, au = 0.0f;
+    for (uint i = lane; i < in_dim; i += 32u) {
+        uint gi = i / group_size;
+        float xi = x[i];
+        uint sh = (i % 8u) * 4u;
+        uint qg = (rg[i / 8u] >> sh) & 0xFu;
+        uint qu = (ru[i / 8u] >> sh) & 0xFu;
+        ag += ((float)qg * sgr[gi] + bgr[gi]) * xi;
+        au += ((float)qu * sur[gi] + bur[gi]) * xi;
+    }
+    ag = simd_sum(ag);
+    au = simd_sum(au);
+    if (lane == 0) {
+        float act;
+        if (geglu != 0u) {
+            const float c = 0.7978845608028654f;
+            float arg = clamp(c * (ag + 0.044715f * ag * ag * ag), -30.0f, 30.0f);
+            act = 0.5f * ag * (1.0f + tanh(arg));
+        } else {
+            act = ag / (1.0f + exp(-ag));
+        }
+        hidden[o] = act * au;
+    }
+}
+
 // Multi-row BF16 matvec (for SafeTensors / HF weights). bf16 is the top 16 bits
 // of an f32, so dequant is a 16-bit left shift. Lanes stride the in_dim with
 // coalesced reads; each simdgroup does NR0 rows, reusing each activation.
