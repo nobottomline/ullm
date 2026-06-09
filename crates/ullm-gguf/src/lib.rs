@@ -15,6 +15,7 @@ use std::path::Path;
 
 use ullm_core::ir::{ModelSpec, TensorBag, TensorInfo};
 use ullm_core::{DType, Error, Result};
+use ullm_tokenizer::Tokenizer;
 
 use reader::Reader;
 use types::dtype_from_ggml;
@@ -221,6 +222,84 @@ impl GgufModel {
             num_kv_heads,
             vocab_size,
         }
+    }
+
+    /// Build the model's tokenizer from its `tokenizer.ggml.*` metadata.
+    pub fn tokenizer(&self) -> Result<Tokenizer> {
+        let model_type = self
+            .metadata
+            .get("tokenizer.ggml.model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if model_type != "llama" {
+            return Err(Error::Unsupported(format!(
+                "tokenizer model '{model_type}' is not supported yet (only llama/SPM)"
+            )));
+        }
+
+        let tokens = self.string_array("tokenizer.ggml.tokens")?;
+        let scores = self.f32_array("tokenizer.ggml.scores")?;
+        let token_types = self
+            .i32_array("tokenizer.ggml.token_type")
+            .unwrap_or_default();
+        let special = |key: &str| {
+            self.metadata
+                .get(key)
+                .and_then(Value::to_u64)
+                .map(|v| v as u32)
+        };
+        let flag = |key: &str, default: bool| {
+            self.metadata
+                .get(key)
+                .and_then(Value::to_u64)
+                .map(|v| v != 0)
+                .unwrap_or(default)
+        };
+
+        Tokenizer::from_sentencepiece(
+            tokens,
+            scores,
+            token_types,
+            special("tokenizer.ggml.bos_token_id"),
+            special("tokenizer.ggml.eos_token_id"),
+            special("tokenizer.ggml.unknown_token_id"),
+            flag("tokenizer.ggml.add_bos_token", true),
+            flag("tokenizer.ggml.add_space_prefix", true),
+        )
+    }
+
+    fn string_array(&self, key: &str) -> Result<Vec<String>> {
+        let arr = self
+            .metadata
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Format(format!("missing or non-array metadata '{key}'")))?;
+        arr.iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| Error::Format(format!("non-string element in '{key}'")))
+            })
+            .collect()
+    }
+
+    fn f32_array(&self, key: &str) -> Result<Vec<f32>> {
+        let arr = self
+            .metadata
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Format(format!("missing or non-array metadata '{key}'")))?;
+        arr.iter()
+            .map(|v| {
+                v.to_f32()
+                    .ok_or_else(|| Error::Format(format!("non-float element in '{key}'")))
+            })
+            .collect()
+    }
+
+    fn i32_array(&self, key: &str) -> Option<Vec<i32>> {
+        let arr = self.metadata.get(key).and_then(Value::as_array)?;
+        arr.iter().map(|v| v.to_u64().map(|x| x as i32)).collect()
     }
 }
 

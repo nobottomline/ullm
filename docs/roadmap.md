@@ -10,7 +10,7 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 - ☑ `ullm-core`: error type, `DType`, hardware detection, IR skeleton
 - ☑ `ullm-cli`: `ullm doctor`
 - ☑ GGUF loader → `TensorBag` + `ModelSpec` (mmap, k-quant sizing, `ullm inspect`)
-- ☐ Tokenizer (GGUF vocab + HF `tokenizers`)
+- ☑ Tokenizer — SentencePiece/SPM from GGUF (`tokenizer.ggml.*`), byte fallback, `ullm tokenize`
 - ☐ CPU reference backend (correctness oracle, not speed)
 - ☐ Single forward pass of one small model (e.g. Qwen3-0.6B) — greedy decode
 

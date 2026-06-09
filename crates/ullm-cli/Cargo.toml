@@ -15,4 +15,5 @@ path = "src/main.rs"
 [dependencies]
 ullm-core = { workspace = true }
 ullm-gguf = { workspace = true }
+ullm-tokenizer = { workspace = true }
 clap = { workspace = true }

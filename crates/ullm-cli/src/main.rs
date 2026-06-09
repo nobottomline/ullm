@@ -22,6 +22,13 @@ enum Command {
         /// Path to a `.gguf` model file.
         path: PathBuf,
     },
+    /// Tokenize text with a GGUF model's tokenizer, then round-trip it back.
+    Tokenize {
+        /// Path to a `.gguf` model file.
+        path: PathBuf,
+        /// Text to tokenize.
+        text: String,
+    },
     /// Run a model (not yet implemented — see docs/roadmap.md).
     Run,
     /// Start an OpenAI-compatible server (not yet implemented).
@@ -33,6 +40,7 @@ fn main() {
     match cli.command {
         Command::Doctor => doctor(),
         Command::Inspect { path } => inspect(&path),
+        Command::Tokenize { path, text } => tokenize(&path, &text),
         Command::Run | Command::Serve => {
             eprintln!("not yet implemented — see docs/roadmap.md (Phase 0)");
             std::process::exit(1);
@@ -74,4 +82,61 @@ fn inspect(path: &Path) {
     println!("  heads:         {} (kv {})", s.num_heads, s.num_kv_heads);
     println!("  vocab:         {}", s.vocab_size);
     println!("  tensors:       {}", model.tensors.len());
+
+    if let Some(tk) = model
+        .metadata_get("tokenizer.ggml.model")
+        .and_then(|v| v.as_str())
+    {
+        println!("  tokenizer:     {tk}");
+    }
+    let arr_len = |k: &str| {
+        model
+            .metadata_get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+    };
+    println!(
+        "  tok arrays:    tokens={:?} scores={:?} merges={:?} types={:?}",
+        arr_len("tokenizer.ggml.tokens"),
+        arr_len("tokenizer.ggml.scores"),
+        arr_len("tokenizer.ggml.merges"),
+        arr_len("tokenizer.ggml.token_type"),
+    );
+    for key in [
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.unknown_token_id",
+    ] {
+        if let Some(id) = model.metadata_get(key).and_then(|v| v.to_u64()) {
+            println!("  {key} = {id}");
+        }
+    }
+    if let Some(toks) = model
+        .metadata_get("tokenizer.ggml.tokens")
+        .and_then(|v| v.as_array())
+    {
+        let sample: Vec<&str> = toks.iter().take(14).filter_map(|v| v.as_str()).collect();
+        println!("  first tokens:  {sample:?}");
+    }
+}
+
+fn tokenize(path: &Path, text: &str) {
+    let model = match GgufModel::open(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let tk = match model.tokenizer() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let ids = tk.encode(text, true);
+    println!("input:    {text:?}");
+    println!("tokens:   {} -> {:?}", ids.len(), ids);
+    println!("decoded:  {:?}", tk.decode(&ids));
 }

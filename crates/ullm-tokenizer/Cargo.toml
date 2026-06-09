@@ -1,14 +1,12 @@
 [package]
-name = "ullm-gguf"
+name = "ullm-tokenizer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "GGUF model-file loader for the uLLM inference engine."
+description = "Tokenizers (SentencePiece / byte-level BPE) for the uLLM inference engine."
 
 [dependencies]
 ullm-core = { workspace = true }
-ullm-tokenizer = { workspace = true }
-memmap2 = { workspace = true }

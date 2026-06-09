@@ -2,7 +2,12 @@
 # Workspace manifest. Crates live under crates/.
 [workspace]
 resolver = "2"
-members = ["crates/ullm-core", "crates/ullm-gguf", "crates/ullm-cli"]
+members = [
+    "crates/ullm-core",
+    "crates/ullm-tokenizer",
+    "crates/ullm-gguf",
+    "crates/ullm-cli",
+]
 
 [workspace.package]
 version = "0.0.0"
@@ -15,6 +20,7 @@ homepage = "https://github.com/nobottomline/ullm"
 
 [workspace.dependencies]
 ullm-core = { path = "crates/ullm-core" }
+ullm-tokenizer = { path = "crates/ullm-tokenizer" }
 ullm-gguf = { path = "crates/ullm-gguf" }
 clap = { version = "4.5", features = ["derive"] }
 memmap2 = "0.9"
