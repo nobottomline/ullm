@@ -364,6 +364,42 @@ kernel void matvec_q4k_mr(
     }
 }
 
+// MLX 4-bit matvec: weight is u32-packed (8 nibbles/word, LSB first); each group
+// of `group_size` weights has one scale + bias (value = q*scale + bias). One
+// simdgroup per output row, lanes stride the in_dim, reduced with simd_sum.
+kernel void matvec_mlx4(
+    device const uint*  w          [[buffer(0)]],
+    device const float* x          [[buffer(1)]],
+    device float*       y          [[buffer(2)]],
+    device const float* scales     [[buffer(3)]],
+    device const float* biases     [[buffer(4)]],
+    constant uint&      in_dim     [[buffer(5)]],
+    constant uint&      out_dim    [[buffer(6)]],
+    constant uint&      group_size [[buffer(7)]],
+    uint   tg   [[threadgroup_position_in_grid]],
+    ushort sgi  [[simdgroup_index_in_threadgroup]],
+    ushort sgs  [[simdgroups_per_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    uint o = (uint)tg * sgs + sgi;
+    float acc = 0.0f;
+    if (o < out_dim) {
+        uint words  = in_dim / 8u;
+        uint groups = in_dim / group_size;
+        device const uint*  row  = w + o * words;
+        device const float* srow = scales + o * groups;
+        device const float* brow = biases + o * groups;
+        for (uint i = lane; i < in_dim; i += 32u) {
+            uint word = row[i / 8u];
+            uint q = (word >> ((i % 8u) * 4u)) & 0xFu;
+            uint g = i / group_size;
+            acc += ((float)q * srow[g] + brow[g]) * x[i];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0 && o < out_dim) y[o] = acc;
+}
+
 // Multi-row BF16 matvec (for SafeTensors / HF weights). bf16 is the top 16 bits
 // of an f32, so dequant is a 16-bit left shift. Lanes stride the in_dim with
 // coalesced reads; each simdgroup does NR0 rows, reusing each activation.
@@ -643,6 +679,7 @@ pub struct MetalContext {
     matvec_pso: ComputePipelineState,
     q4k_pso: ComputePipelineState,
     q6k_pso: ComputePipelineState,
+    mlx4_pso: ComputePipelineState,
 }
 
 impl MetalContext {
@@ -666,6 +703,7 @@ impl MetalContext {
             matvec_pso: pso("matvec")?,
             q4k_pso: pso("matvec_q4k")?,
             q6k_pso: pso("matvec_q6k")?,
+            mlx4_pso: pso("matvec_mlx4")?,
             queue,
             device,
         })
@@ -720,6 +758,57 @@ impl MetalContext {
     ) -> Result<Vec<f32>> {
         let pso = self.pso_for(dtype)?;
         Ok(self.dispatch(pso, wbuf, x, out_dim, in_dim))
+    }
+
+    /// MLX 4-bit GEMV: `w` is the packed u32 bytes, `scales`/`biases` the group
+    /// tables. Validates the kernel; the full forward keeps weights resident.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_mlx4(
+        &self,
+        w: &[u8],
+        scales: &[f32],
+        biases: &[f32],
+        x: &[f32],
+        out_dim: usize,
+        in_dim: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let f32buf = |v: &[f32]| {
+            self.device
+                .new_buffer_with_data(v.as_ptr().cast(), (v.len() * 4) as u64, shared)
+        };
+        let wbuf = self.upload(w);
+        let sbuf = f32buf(scales);
+        let bbuf = f32buf(biases);
+        let xbuf = f32buf(x);
+        let ybuf = self.device.new_buffer((out_dim * 4) as u64, shared);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.mlx4_pso);
+        enc.set_buffer(0, Some(&wbuf), 0);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&ybuf), 0);
+        enc.set_buffer(3, Some(&sbuf), 0);
+        enc.set_buffer(4, Some(&bbuf), 0);
+        let (in_u, out_u, gs) = (in_dim as u32, out_dim as u32, group_size as u32);
+        enc.set_bytes(5, 4, (&in_u as *const u32).cast());
+        enc.set_bytes(6, 4, (&out_u as *const u32).cast());
+        enc.set_bytes(7, 4, (&gs as *const u32).cast());
+        let threads = 256u64;
+        let groups = (out_dim as u64).div_ceil(threads / 32);
+        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(threads, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut out = vec![0.0f32; out_dim];
+        // SAFETY: shared storage; `ybuf` holds `out_dim` f32 after completion.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ybuf.contents().cast::<f32>(), out.as_mut_ptr(), out_dim);
+        }
+        out
     }
 
     fn pso_for(&self, dtype: DType) -> Result<&ComputePipelineState> {
@@ -845,5 +934,44 @@ mod tests {
     #[test]
     fn q6k_gemv_matches_cpu() {
         check_quant(DType::Q6K, &[208]); // d half
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn mlx4_gemv_matches_cpu() {
+        let Ok(ctx) = MetalContext::new() else {
+            return; // no GPU (e.g. CI) — skip
+        };
+        let (out, inn, gs) = (96usize, 256usize, 64usize);
+        let words = inn / 8;
+        let groups = inn / gs;
+        // Deterministic pseudo-random packed weights / scales / biases / x.
+        let w: Vec<u8> = (0..out * words * 4)
+            .map(|k| (k.wrapping_mul(131).wrapping_add(7) % 251) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..out * groups)
+            .map(|k| ((k % 7) as f32 - 3.0) * 0.01)
+            .collect();
+        let biases: Vec<f32> = (0..out * groups)
+            .map(|k| ((k % 5) as f32 - 2.0) * 0.02)
+            .collect();
+        let x: Vec<f32> = (0..inn).map(|k| ((k % 13) as f32 - 6.0) * 0.1).collect();
+
+        // CPU reference: value = q*scale + bias, then dot.
+        let cpu: Vec<f32> = (0..out)
+            .map(|o| {
+                let mut acc = 0.0f32;
+                for i in 0..inn {
+                    let wb = (o * words + i / 8) * 4;
+                    let word = u32::from_le_bytes([w[wb], w[wb + 1], w[wb + 2], w[wb + 3]]);
+                    let q = (word >> ((i % 8) * 4)) & 0xF;
+                    let g = o * groups + i / gs;
+                    acc += (q as f32 * scales[g] + biases[g]) * x[i];
+                }
+                acc
+            })
+            .collect();
+        let gpu = ctx.matvec_mlx4(&w, &scales, &biases, &x, out, inn, gs);
+        assert!(rel_err(&gpu, &cpu) < 1e-3, "MLX4 kernel mismatch");
     }
 }
