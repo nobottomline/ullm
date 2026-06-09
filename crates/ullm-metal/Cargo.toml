@@ -1,0 +1,13 @@
+[package]
+name = "ullm-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Metal (Apple GPU) compute backend for the uLLM inference engine."
+
+[dependencies]
+ullm-core = { workspace = true }
+metal = { workspace = true }

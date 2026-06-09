@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use ullm_core::device::Hardware;
 use ullm_gguf::GgufModel;
+use ullm_metal::MetalContext;
 use ullm_model::{LlamaModel, SampleParams};
 
 #[derive(Parser)]
@@ -55,6 +56,8 @@ enum Command {
     },
     /// Start an OpenAI-compatible server (not yet implemented).
     Serve,
+    /// Check the Metal GPU backend and validate a kernel against the CPU.
+    MetalCheck,
 }
 
 fn main() {
@@ -86,6 +89,7 @@ fn main() {
             eprintln!("not yet implemented — see docs/roadmap.md (Phase 0)");
             std::process::exit(1);
         }
+        Command::MetalCheck => metal_check(),
     }
 }
 
@@ -217,4 +221,45 @@ fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams) {
     let mut full = prompt_ids.clone();
     full.extend_from_slice(&generated);
     println!("{}", tk.decode(&full));
+}
+
+fn metal_check() {
+    let ctx = match MetalContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("metal device:  {}", ctx.device_name());
+
+    let (out_dim, in_dim) = (4096usize, 4096usize);
+    let w: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+        .collect();
+    let x: Vec<f32> = (0..in_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+
+    let gpu = ctx.matvec(&w, &x, out_dim, in_dim);
+    let cpu: Vec<f32> = (0..out_dim)
+        .map(|o| {
+            w[o * in_dim..o * in_dim + in_dim]
+                .iter()
+                .zip(&x)
+                .map(|(a, b)| a * b)
+                .sum()
+        })
+        .collect();
+    let max_err = gpu
+        .iter()
+        .zip(&cpu)
+        .map(|(g, c)| (g - c).abs())
+        .fold(0.0f32, f32::max);
+
+    println!("gemv {out_dim}x{in_dim}: max|gpu-cpu| = {max_err:.3e}");
+    if max_err < 1e-2 {
+        println!("validation:    OK (matches CPU reference)");
+    } else {
+        println!("validation:    MISMATCH");
+        std::process::exit(1);
+    }
 }

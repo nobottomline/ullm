@@ -7,6 +7,7 @@ members = [
     "crates/ullm-tokenizer",
     "crates/ullm-gguf",
     "crates/ullm-model",
+    "crates/ullm-metal",
     "crates/ullm-cli",
 ]
 
@@ -24,9 +25,11 @@ ullm-core = { path = "crates/ullm-core" }
 ullm-tokenizer = { path = "crates/ullm-tokenizer" }
 ullm-gguf = { path = "crates/ullm-gguf" }
 ullm-model = { path = "crates/ullm-model" }
+ullm-metal = { path = "crates/ullm-metal" }
 clap = { version = "4.5", features = ["derive"] }
 memmap2 = "0.9"
 rayon = "1"
+metal = "0.33"
 
 # Release profile tuned for a small, fast binary (lightweight is a product goal).
 [profile.release]

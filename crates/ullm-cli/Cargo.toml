@@ -17,4 +17,5 @@ ullm-core = { workspace = true }
 ullm-gguf = { workspace = true }
 ullm-tokenizer = { workspace = true }
 ullm-model = { workspace = true }
+ullm-metal = { workspace = true }
 clap = { workspace = true }
