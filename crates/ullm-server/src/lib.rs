@@ -23,6 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use ullm_core::{Error, Result};
 use ullm_gguf::GgufModel;
 use ullm_model::{LlamaModel, SampleParams};
+use ullm_safetensors::SafeTensorsModel;
 use ullm_tokenizer::Tokenizer;
 
 /// A loaded model + tokenizer, generation-ready.
@@ -33,10 +34,30 @@ struct Engine {
 }
 
 impl Engine {
-    fn load(path: &Path) -> Result<Self> {
-        let gguf = GgufModel::open(path)?;
-        let tokenizer = gguf.tokenizer()?;
-        let model = LlamaModel::from_gguf(&gguf)?;
+    fn load(path: &Path, gpu: bool) -> Result<Self> {
+        let is_hf = path.is_dir() || path.extension().is_some_and(|e| e == "safetensors");
+        let (tokenizer, mut model) = if is_hf {
+            let st = SafeTensorsModel::open(path)?;
+            let tj = st
+                .tokenizer_json_path()
+                .ok_or_else(|| Error::Format("no tokenizer.json next to the model".into()))?;
+            let bytes = std::fs::read(&tj)?;
+            let bos = st.config_usize("bos_token_id").map(|v| v as u32);
+            let eos = st.config_usize("eos_token_id").map(|v| v as u32);
+            let tk = Tokenizer::from_hf_json(&bytes, bos, eos, false)?;
+            let m = LlamaModel::from_safetensors(&st)?;
+            (tk, m)
+        } else {
+            let gguf = GgufModel::open(path)?;
+            let tk = gguf.tokenizer()?;
+            let m = LlamaModel::from_gguf(&gguf)?;
+            (tk, m)
+        };
+        if gpu {
+            if let Err(e) = model.enable_gpu() {
+                eprintln!("uLLM server: GPU init failed ({e}); falling back to CPU");
+            }
+        }
         let model_id = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -99,8 +120,9 @@ struct AppState {
 }
 
 /// Load the model and serve until the process is stopped (blocking).
-pub fn run(model_path: &Path, host: &str, port: u16) -> Result<()> {
-    let engine = Engine::load(model_path)?;
+pub fn run(model_path: &Path, host: &str, port: u16, gpu: bool) -> Result<()> {
+    let engine = Engine::load(model_path, gpu)?;
+    let backend = if engine.model.gpu_enabled() { "gpu" } else { "cpu" };
     let model_id = engine.model_id.clone();
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
@@ -122,7 +144,7 @@ pub fn run(model_path: &Path, host: &str, port: u16) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::Format(format!("bind {addr}: {e}")))?;
-        println!("uLLM server: model '{model_id}' ready on http://{addr}");
+        println!("uLLM server: model '{model_id}' ({backend}) ready on http://{addr}");
         axum::serve(listener, app)
             .await
             .map_err(|e| Error::Format(format!("serve: {e}")))?;

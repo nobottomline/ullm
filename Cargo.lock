@@ -891,6 +891,7 @@ dependencies = [
  "ullm-core",
  "ullm-gguf",
  "ullm-model",
+ "ullm-safetensors",
  "ullm-tokenizer",
 ]
 

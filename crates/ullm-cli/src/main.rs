@@ -61,7 +61,7 @@ enum Command {
     },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
-        /// Path to a `.gguf` model file.
+        /// Path to a `.gguf` file or HF model directory.
         path: PathBuf,
         /// Host / interface to bind.
         #[arg(long, default_value = "127.0.0.1")]
@@ -69,6 +69,9 @@ enum Command {
         /// Port to listen on.
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// Run the forward pass on the Metal GPU.
+        #[arg(long)]
+        gpu: bool,
     },
     /// Check the Metal GPU backend and validate a kernel against the CPU.
     MetalCheck,
@@ -109,8 +112,13 @@ fn main() {
             },
             gpu,
         ),
-        Command::Serve { path, host, port } => {
-            if let Err(e) = ullm_server::run(&path, &host, port) {
+        Command::Serve {
+            path,
+            host,
+            port,
+            gpu,
+        } => {
+            if let Err(e) = ullm_server::run(&path, &host, port, gpu) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
