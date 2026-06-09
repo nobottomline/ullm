@@ -58,6 +58,7 @@ impl Tokenizer {
             }
         }
 
+        let specials = crate::collect_specials(&tokens, &types);
         Ok(Tokenizer {
             tokens,
             scores,
@@ -70,6 +71,7 @@ impl Tokenizer {
             add_bos,
             add_space_prefix,
             bpe: None,
+            specials,
         })
     }
 

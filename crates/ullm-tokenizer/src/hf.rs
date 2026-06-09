@@ -192,4 +192,11 @@ mod tests {
         let v: Value = serde_json::from_slice(&synthetic_json()).unwrap();
         assert!(extract_split_regex(&v).unwrap().contains(r"\p{L}"));
     }
+
+    #[test]
+    fn special_tokens_matched_verbatim() {
+        let tk = Tokenizer::from_hf_json(&synthetic_json(), None, Some(258), false).unwrap();
+        // "he" merges to 256; the special "<|end|>" is one id (258); "he" -> 256.
+        assert_eq!(tk.encode("he<|end|>he", false), vec![256, 258, 256]);
+    }
 }

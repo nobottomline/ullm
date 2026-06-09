@@ -52,6 +52,29 @@ pub struct Tokenizer {
     add_bos: bool,
     add_space_prefix: bool,
     bpe: Option<BpeData>,
+    /// Control / user-defined tokens (e.g. `<|im_start|>`, `<start_of_turn>`)
+    /// matched verbatim in the input before sub-word tokenization, longest
+    /// first. Needed so chat-template markers map to their single token id.
+    specials: Vec<(String, u32)>,
+}
+
+/// Collect the bracketed control / user-defined tokens for verbatim matching.
+pub(crate) fn collect_specials(tokens: &[String], types: &[TokenType]) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| {
+            !t.is_empty()
+                && (t.starts_with('<') || t.starts_with('['))
+                && matches!(
+                    types.get(*i),
+                    Some(TokenType::Control) | Some(TokenType::UserDefined)
+                )
+        })
+        .map(|(i, t)| (t.clone(), i as u32))
+        .collect();
+    v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    v
 }
 
 impl Tokenizer {
@@ -79,12 +102,54 @@ impl Tokenizer {
                 out.push(bos);
             }
         }
-        if self.bpe.is_some() {
-            self.encode_bpe(text, &mut out);
-        } else {
-            self.encode_spm(text, &mut out);
-        }
+        self.encode_segments(text, &mut out);
         out
+    }
+
+    /// Split the input on verbatim special tokens (each emitted as its own id),
+    /// sub-word-tokenizing the spans in between.
+    fn encode_segments(&self, text: &str, out: &mut Vec<u32>) {
+        if self.specials.is_empty() {
+            return self.encode_raw(text, out);
+        }
+        let mut seg_start = 0;
+        let mut i = 0;
+        while i < text.len() {
+            let b = text.as_bytes()[i];
+            let mut matched = None;
+            if b == b'<' || b == b'[' {
+                for (s, id) in &self.specials {
+                    if text[i..].starts_with(s.as_str()) {
+                        matched = Some((s.len(), *id));
+                        break;
+                    }
+                }
+            }
+            if let Some((len, id)) = matched {
+                if seg_start < i {
+                    self.encode_raw(&text[seg_start..i], out);
+                }
+                out.push(id);
+                i += len;
+                seg_start = i;
+            } else {
+                i += 1;
+                while i < text.len() && !text.is_char_boundary(i) {
+                    i += 1;
+                }
+            }
+        }
+        if seg_start < text.len() {
+            self.encode_raw(&text[seg_start..], out);
+        }
+    }
+
+    fn encode_raw(&self, text: &str, out: &mut Vec<u32>) {
+        if self.bpe.is_some() {
+            self.encode_bpe(text, out);
+        } else {
+            self.encode_spm(text, out);
+        }
     }
 
     /// Decode token ids back into text.

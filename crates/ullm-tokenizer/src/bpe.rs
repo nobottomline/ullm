@@ -96,6 +96,7 @@ impl Tokenizer {
             }
         }
 
+        let specials = crate::collect_specials(&tokens, &types);
         Ok(Tokenizer {
             tokens,
             scores: Vec::new(),
@@ -113,6 +114,7 @@ impl Tokenizer {
                 byte_decoder,
                 regex,
             }),
+            specials,
         })
     }
 
