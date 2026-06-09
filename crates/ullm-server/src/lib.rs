@@ -45,11 +45,16 @@ impl Engine {
     }
 
     /// Returns (text, prompt_tokens, completion_tokens).
-    fn complete(&mut self, prompt: &str, max_tokens: usize, params: &SampleParams) -> (String, usize, usize) {
+    fn complete(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        params: &SampleParams,
+    ) -> (String, usize, usize) {
         let prompt_ids = self.tokenizer.encode(prompt, true);
-        let generated = self
-            .model
-            .generate(&prompt_ids, max_tokens, self.tokenizer.eos_id(), params);
+        let generated =
+            self.model
+                .generate(&prompt_ids, max_tokens, self.tokenizer.eos_id(), params);
         let text = self.tokenizer.decode(&generated);
         (text, prompt_ids.len(), generated.len())
     }
@@ -170,7 +175,10 @@ struct Usage {
     total_tokens: usize,
 }
 
-async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest>) -> Json<ChatResponse> {
+async fn chat_completions(
+    State(s): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> Json<ChatResponse> {
     let prompt = build_prompt(&req.messages);
     let max_tokens = req.max_tokens.unwrap_or(128);
     let params = SampleParams {

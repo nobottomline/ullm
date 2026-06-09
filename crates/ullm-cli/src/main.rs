@@ -244,33 +244,79 @@ fn metal_check() {
     };
     println!("metal device:  {}", ctx.device_name());
 
-    let (out_dim, in_dim) = (4096usize, 4096usize);
-    let w: Vec<f32> = (0..out_dim * in_dim)
-        .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
-        .collect();
-    let x: Vec<f32> = (0..in_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+    let (o, i) = (1024usize, 4096usize);
+    let x: Vec<f32> = (0..i).map(|k| ((k % 13) as f32 - 6.0) * 0.1).collect();
 
-    let gpu = ctx.matvec(&w, &x, out_dim, in_dim);
-    let cpu: Vec<f32> = (0..out_dim)
+    let mut ok = true;
+    {
+        let w: Vec<f32> = (0..o * i).map(|k| ((k % 17) as f32 - 8.0) * 0.01).collect();
+        ok &= report("f32 ", &ctx.matvec(&w, &x, o, i), &cpu_ref(&w, &x, o, i));
+    }
+    ok &= check_quant(&ctx, ullm_core::DType::Q4K, "Q4_K", &x, o, i);
+    ok &= check_quant(&ctx, ullm_core::DType::Q6K, "Q6_K", &x, o, i);
+
+    if !ok {
+        std::process::exit(1);
+    }
+}
+
+fn cpu_ref(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    (0..out_dim)
         .map(|o| {
             w[o * in_dim..o * in_dim + in_dim]
                 .iter()
-                .zip(&x)
+                .zip(x)
                 .map(|(a, b)| a * b)
                 .sum()
         })
-        .collect();
-    let max_err = gpu
+        .collect()
+}
+
+fn report(label: &str, gpu: &[f32], cpu: &[f32]) -> bool {
+    let scale = cpu.iter().map(|c| c.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let abs = gpu
         .iter()
-        .zip(&cpu)
+        .zip(cpu)
         .map(|(g, c)| (g - c).abs())
         .fold(0.0f32, f32::max);
+    let rel = abs / scale;
+    let status = if rel < 1e-3 { "OK" } else { "MISMATCH" };
+    println!("  {label} GEMV vs CPU: rel err {rel:.2e}  [{status}]");
+    rel < 1e-3
+}
 
-    println!("gemv {out_dim}x{in_dim}: max|gpu-cpu| = {max_err:.3e}");
-    if max_err < 1e-2 {
-        println!("validation:    OK (matches CPU reference)");
+fn check_quant(
+    ctx: &MetalContext,
+    dtype: ullm_core::DType,
+    label: &str,
+    x: &[f32],
+    o: usize,
+    i: usize,
+) -> bool {
+    let ts = dtype.type_size();
+    let total = o * (i / 256) * ts;
+    let half = 0x3000u16.to_le_bytes(); // 0.125 — keeps dequantized values finite
+    let mut w: Vec<u8> = (0..total)
+        .map(|k| (k.wrapping_mul(131).wrapping_add(7) % 251) as u8)
+        .collect();
+    let d_offsets: &[usize] = if dtype == ullm_core::DType::Q6K {
+        &[208]
     } else {
-        println!("validation:    MISMATCH");
-        std::process::exit(1);
+        &[0, 2]
+    };
+    for blk in w.chunks_mut(ts) {
+        for &off in d_offsets {
+            blk[off] = half[0];
+            blk[off + 1] = half[1];
+        }
+    }
+    let cpu_w = ullm_core::dequant::dequantize(dtype, &w, o * i).expect("cpu dequant");
+    let cpu = cpu_ref(&cpu_w, x, o, i);
+    match ctx.matvec_quant(dtype, &w, x, o, i) {
+        Ok(gpu) => report(label, &gpu, &cpu),
+        Err(e) => {
+            eprintln!("error: {e}");
+            false
+        }
     }
 }
