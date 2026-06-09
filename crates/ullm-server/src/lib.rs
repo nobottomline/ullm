@@ -31,12 +31,13 @@ struct Engine {
     model: LlamaModel,
     tokenizer: Tokenizer,
     model_id: String,
+    chat_format: ChatFormat,
 }
 
 impl Engine {
     fn load(path: &Path, gpu: bool) -> Result<Self> {
         let is_hf = path.is_dir() || path.extension().is_some_and(|e| e == "safetensors");
-        let (tokenizer, mut model) = if is_hf {
+        let (tokenizer, mut model, template) = if is_hf {
             let st = SafeTensorsModel::open(path)?;
             let tj = st
                 .tokenizer_json_path()
@@ -46,18 +47,24 @@ impl Engine {
             let eos = st.config_usize("eos_token_id").map(|v| v as u32);
             let tk = Tokenizer::from_hf_json(&bytes, bos, eos, false)?;
             let m = LlamaModel::from_safetensors(&st)?;
-            (tk, m)
+            let template = hf_chat_template(path);
+            (tk, m, template)
         } else {
             let gguf = GgufModel::open(path)?;
             let tk = gguf.tokenizer()?;
+            let template = gguf
+                .metadata_get("tokenizer.chat_template")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let m = LlamaModel::from_gguf(&gguf)?;
-            (tk, m)
+            (tk, m, template)
         };
         if gpu {
             if let Err(e) = model.enable_gpu() {
                 eprintln!("uLLM server: GPU init failed ({e}); falling back to CPU");
             }
         }
+        let chat_format = ChatFormat::detect(template.as_deref());
         let model_id = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -67,6 +74,7 @@ impl Engine {
             model,
             tokenizer,
             model_id,
+            chat_format,
         })
     }
 
@@ -117,6 +125,7 @@ impl Engine {
 struct AppState {
     engine: Arc<Mutex<Engine>>,
     model_id: String,
+    chat_format: ChatFormat,
 }
 
 /// Load the model and serve until the process is stopped (blocking).
@@ -124,9 +133,11 @@ pub fn run(model_path: &Path, host: &str, port: u16, gpu: bool) -> Result<()> {
     let engine = Engine::load(model_path, gpu)?;
     let backend = if engine.model.gpu_enabled() { "gpu" } else { "cpu" };
     let model_id = engine.model_id.clone();
+    let chat_format = engine.chat_format;
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         model_id: model_id.clone(),
+        chat_format,
     };
 
     let app = Router::new()
@@ -232,7 +243,7 @@ struct Usage {
 }
 
 async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
-    let prompt = build_prompt(&req.messages);
+    let prompt = s.chat_format.build_prompt(&req.messages);
     let max_tokens = req.max_tokens.unwrap_or(128);
     let params = SampleParams {
         temperature: req.temperature.unwrap_or(0.0),
@@ -342,16 +353,85 @@ fn chunk_json(
     serde_json::to_string(&chunk).unwrap_or_default()
 }
 
-/// Render chat messages into a Zephyr/TinyLlama-style prompt.
-fn build_prompt(messages: &[ChatMessage]) -> String {
-    let mut p = String::new();
-    for m in messages {
-        let tag = match m.role.as_str() {
-            "system" | "user" | "assistant" => m.role.as_str(),
-            _ => "user",
-        };
-        p.push_str(&format!("<|{tag}|>\n{}\n", m.content));
+/// Read a Hugging Face model's chat template (`chat_template.jinja` or the
+/// `chat_template` field of `tokenizer_config.json`).
+fn hf_chat_template(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join("chat_template.jinja"))
+        .ok()
+        .or_else(|| {
+            let cfg = std::fs::read_to_string(dir.join("tokenizer_config.json")).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&cfg).ok()?;
+            v.get("chat_template")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// The chat prompt format a model expects, detected from its chat template.
+#[derive(Clone, Copy, Debug)]
+enum ChatFormat {
+    ChatML,
+    Gemma,
+    Llama3,
+    Zephyr,
+}
+
+impl ChatFormat {
+    /// Pick a format from the model's `chat_template` string (substring markers).
+    fn detect(template: Option<&str>) -> Self {
+        match template {
+            Some(t) if t.contains("<|im_start|>") => ChatFormat::ChatML,
+            Some(t) if t.contains("<start_of_turn>") => ChatFormat::Gemma,
+            Some(t) if t.contains("<|start_header_id|>") => ChatFormat::Llama3,
+            _ => ChatFormat::Zephyr,
+        }
     }
-    p.push_str("<|assistant|>\n");
-    p
+
+    /// Render messages into the model's native chat prompt, ending with the
+    /// open assistant turn. Special-token markers tokenize to single ids.
+    fn build_prompt(&self, messages: &[ChatMessage]) -> String {
+        let mut p = String::new();
+        match self {
+            ChatFormat::ChatML => {
+                for m in messages {
+                    let r = norm_role(&m.role, "user");
+                    p.push_str(&format!("<|im_start|>{r}\n{}<|im_end|>\n", m.content));
+                }
+                p.push_str("<|im_start|>assistant\n");
+            }
+            ChatFormat::Gemma => {
+                for m in messages {
+                    // Gemma has no system role; fold it into a user turn.
+                    let r = if m.role == "assistant" { "model" } else { "user" };
+                    p.push_str(&format!("<start_of_turn>{r}\n{}<end_of_turn>\n", m.content));
+                }
+                p.push_str("<start_of_turn>model\n");
+            }
+            ChatFormat::Llama3 => {
+                for m in messages {
+                    let r = norm_role(&m.role, "user");
+                    p.push_str(&format!(
+                        "<|start_header_id|>{r}<|end_header_id|>\n\n{}<|eot_id|>",
+                        m.content
+                    ));
+                }
+                p.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            }
+            ChatFormat::Zephyr => {
+                for m in messages {
+                    let r = norm_role(&m.role, "user");
+                    p.push_str(&format!("<|{r}|>\n{}\n", m.content));
+                }
+                p.push_str("<|assistant|>\n");
+            }
+        }
+        p
+    }
+}
+
+fn norm_role<'a>(role: &'a str, default: &'a str) -> &'a str {
+    match role {
+        "system" | "user" | "assistant" => role,
+        _ => default,
+    }
 }
