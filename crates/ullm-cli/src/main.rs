@@ -225,6 +225,7 @@ fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams) {
             std::process::exit(1);
         }
     };
+    drop(model); // weights are now owned by `lm`; release the mmap
 
     let prompt_ids = tk.encode(prompt, true);
     let generated = lm.generate(&prompt_ids, max_tokens, tk.eos_id(), &params);

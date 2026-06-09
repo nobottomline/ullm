@@ -50,6 +50,16 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 
 /// Dequantize `n` elements of `dtype` from `data` into a fresh `f32` vector.
 pub fn dequantize(dtype: DType, data: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = vec![0.0f32; n];
+    dequantize_into(dtype, data, &mut out)?;
+    Ok(out)
+}
+
+/// Dequantize `dtype` from `data` into the caller's buffer `out` (one f32 per
+/// element; `out.len()` is the element count). Lets hot loops reuse a buffer
+/// instead of allocating per call.
+pub fn dequantize_into(dtype: DType, data: &[u8], out: &mut [f32]) -> Result<()> {
+    let n = out.len();
     let block = dtype.block_size();
     let ts = dtype.type_size();
     if block == 0 || n % block != 0 {
@@ -66,7 +76,6 @@ pub fn dequantize(dtype: DType, data: &[u8], n: usize) -> Result<Vec<f32>> {
         )));
     }
 
-    let mut out = vec![0.0f32; n];
     match dtype {
         DType::F32 => {
             for (o, c) in out.iter_mut().zip(data.chunks_exact(4)) {
@@ -83,21 +92,21 @@ pub fn dequantize(dtype: DType, data: &[u8], n: usize) -> Result<Vec<f32>> {
                 *o = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
             }
         }
-        DType::Q8_0 => q8_0(data, nblocks, &mut out),
-        DType::Q4_0 => q4_0(data, nblocks, &mut out),
-        DType::Q4_1 => q4_1(data, nblocks, &mut out),
-        DType::Q5_0 => q5_0(data, nblocks, &mut out),
-        DType::Q5_1 => q5_1(data, nblocks, &mut out),
-        DType::Q4K => q4_k(data, nblocks, &mut out),
-        DType::Q5K => q5_k(data, nblocks, &mut out),
-        DType::Q6K => q6_k(data, nblocks, &mut out),
+        DType::Q8_0 => q8_0(data, nblocks, out),
+        DType::Q4_0 => q4_0(data, nblocks, out),
+        DType::Q4_1 => q4_1(data, nblocks, out),
+        DType::Q5_0 => q5_0(data, nblocks, out),
+        DType::Q5_1 => q5_1(data, nblocks, out),
+        DType::Q4K => q4_k(data, nblocks, out),
+        DType::Q5K => q5_k(data, nblocks, out),
+        DType::Q6K => q6_k(data, nblocks, out),
         other => {
             return Err(Error::Unsupported(format!(
                 "dequantization of {other:?} is not implemented yet"
             )));
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn q8_0(data: &[u8], nblocks: usize, out: &mut [f32]) {

@@ -1,13 +1,14 @@
-//! A minimal, correctness-first CPU runtime for the Llama architecture.
+//! A correctness-first CPU runtime for the Llama architecture.
 //!
-//! Phase 0 scope: F32 weights, a single sequence, greedy decoding. The goal is a
-//! readable numerical reference — the oracle the Metal backend will be validated
-//! against — not speed. Quantized weights, batching, and SIMD come later.
+//! Weights stay in their quantized GGUF form and are dequantized one row at a
+//! time during each matmul (in parallel over rows), so the model uses ~4-7x less
+//! memory than f32 and starts with no up-front dequantization. It remains the
+//! numerical reference the Metal backend is validated against.
 
 use std::cmp::Ordering;
 
 use rayon::prelude::*;
-use ullm_core::{Error, Result};
+use ullm_core::{DType, Error, Result};
 use ullm_gguf::GgufModel;
 
 /// Hyperparameters describing a Llama model.
@@ -49,32 +50,48 @@ impl Default for SampleParams {
     }
 }
 
-/// Per-layer weights (row-major `[out, in]`, as produced by the GGUF loader).
+/// A weight matrix kept in its quantized GGUF form (`[out, cols]`, row-major).
+/// Rows are dequantized on demand during the matmul.
+#[derive(Clone)]
+struct QWeight {
+    data: Vec<u8>,
+    dtype: DType,
+    out: usize,
+    cols: usize,
+}
+
+impl QWeight {
+    fn row_bytes(&self) -> usize {
+        (self.cols / self.dtype.block_size()) * self.dtype.type_size()
+    }
+}
+
+/// Per-layer weights: norms in f32 (tiny), projections kept quantized.
 struct LayerWeights {
     attn_norm: Vec<f32>,
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    wo: Vec<f32>,
+    wq: QWeight,
+    wk: QWeight,
+    wv: QWeight,
+    wo: QWeight,
     ffn_norm: Vec<f32>,
-    w_gate: Vec<f32>,
-    w_up: Vec<f32>,
-    w_down: Vec<f32>,
+    w_gate: QWeight,
+    w_up: QWeight,
+    w_down: QWeight,
 }
 
 /// A loaded Llama model with its KV cache.
 pub struct LlamaModel {
     pub config: LlamaConfig,
-    tok_embeddings: Vec<f32>, // [vocab, n_embd]
+    tok_embeddings: QWeight, // [vocab, n_embd]
     layers: Vec<LayerWeights>,
     final_norm: Vec<f32>, // [n_embd]
-    output: Vec<f32>,     // [vocab, n_embd]
+    output: QWeight,      // [vocab, n_embd]
     key_cache: Vec<f32>,  // [n_layer * n_ctx * kv_dim]
     val_cache: Vec<f32>,
 }
 
 impl LlamaModel {
-    /// Load a Llama model from a parsed GGUF file (F32 weights only for now).
+    /// Load a Llama model from a parsed GGUF file (any supported quantization).
     pub fn from_gguf(model: &GgufModel) -> Result<Self> {
         let arch = model.architecture().unwrap_or_default();
         if arch != "llama" {
@@ -118,24 +135,24 @@ impl LlamaModel {
             eps,
         };
 
-        let tok_embeddings = tensor_f32(model, "token_embd.weight")?;
+        let tok_embeddings = qweight(model, "token_embd.weight")?;
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
             layers.push(LayerWeights {
                 attn_norm: tensor_f32(model, &format!("blk.{i}.attn_norm.weight"))?,
-                wq: tensor_f32(model, &format!("blk.{i}.attn_q.weight"))?,
-                wk: tensor_f32(model, &format!("blk.{i}.attn_k.weight"))?,
-                wv: tensor_f32(model, &format!("blk.{i}.attn_v.weight"))?,
-                wo: tensor_f32(model, &format!("blk.{i}.attn_output.weight"))?,
+                wq: qweight(model, &format!("blk.{i}.attn_q.weight"))?,
+                wk: qweight(model, &format!("blk.{i}.attn_k.weight"))?,
+                wv: qweight(model, &format!("blk.{i}.attn_v.weight"))?,
+                wo: qweight(model, &format!("blk.{i}.attn_output.weight"))?,
                 ffn_norm: tensor_f32(model, &format!("blk.{i}.ffn_norm.weight"))?,
-                w_gate: tensor_f32(model, &format!("blk.{i}.ffn_gate.weight"))?,
-                w_up: tensor_f32(model, &format!("blk.{i}.ffn_up.weight"))?,
-                w_down: tensor_f32(model, &format!("blk.{i}.ffn_down.weight"))?,
+                w_gate: qweight(model, &format!("blk.{i}.ffn_gate.weight"))?,
+                w_up: qweight(model, &format!("blk.{i}.ffn_up.weight"))?,
+                w_down: qweight(model, &format!("blk.{i}.ffn_down.weight"))?,
             });
         }
         let final_norm = tensor_f32(model, "output_norm.weight")?;
         // Some models tie the output projection to the input embeddings.
-        let output = tensor_f32(model, "output.weight").unwrap_or_else(|_| tok_embeddings.clone());
+        let output = qweight(model, "output.weight").unwrap_or_else(|_| tok_embeddings.clone());
 
         let kv_dim = n_kv_head * head_dim;
         let cache = vec![0.0f32; n_layer * n_ctx * kv_dim];
@@ -163,22 +180,27 @@ impl LlamaModel {
         let n_ctx = c.n_ctx;
         let n_layer = c.n_layer;
         let n_head = c.n_head;
-        let n_ff = c.n_ff;
         let eps = c.eps;
         let rope_theta = c.rope_theta;
         let scale = (head_dim as f32).sqrt().recip();
 
-        let base = token as usize * dim;
-        let mut x = self.tok_embeddings[base..base + dim].to_vec();
+        let mut x = vec![0.0f32; dim];
+        {
+            let w = &self.tok_embeddings;
+            let rb = w.row_bytes();
+            let o = token as usize;
+            ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], &mut x)
+                .expect("dequantize embedding row");
+        }
 
         for l in 0..n_layer {
             let lw = &self.layers[l];
 
             // --- attention ---
             let xb = rmsnorm(&x, &lw.attn_norm, eps);
-            let mut q = matvec(&lw.wq, &xb, q_dim, dim);
-            let mut k = matvec(&lw.wk, &xb, kv_dim, dim);
-            let v = matvec(&lw.wv, &xb, kv_dim, dim);
+            let mut q = matvec_q(&lw.wq, &xb);
+            let mut k = matvec_q(&lw.wk, &xb);
+            let v = matvec_q(&lw.wv, &xb);
             rope(&mut q, n_head, head_dim, pos, rope_theta);
             rope(&mut k, c.n_kv_head, head_dim, pos, rope_theta);
 
@@ -211,24 +233,24 @@ impl LlamaModel {
                 }
             }
 
-            let attn = matvec(&lw.wo, &att_out, dim, q_dim);
+            let attn = matvec_q(&lw.wo, &att_out);
             for (xi, ai) in x.iter_mut().zip(&attn) {
                 *xi += ai;
             }
 
             // --- feed-forward (SwiGLU) ---
             let xb = rmsnorm(&x, &lw.ffn_norm, eps);
-            let gate = matvec(&lw.w_gate, &xb, n_ff, dim);
-            let up = matvec(&lw.w_up, &xb, n_ff, dim);
+            let gate = matvec_q(&lw.w_gate, &xb);
+            let up = matvec_q(&lw.w_up, &xb);
             let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-            let down = matvec(&lw.w_down, &hidden, dim, n_ff);
+            let down = matvec_q(&lw.w_down, &hidden);
             for (xi, di) in x.iter_mut().zip(&down) {
                 *xi += di;
             }
         }
 
         let x = rmsnorm(&x, &self.final_norm, eps);
-        matvec(&self.output, &x, c.vocab_size, dim)
+        matvec_q(&self.output, &x)
     }
 
     /// Greedily generate up to `max_new` tokens after `prompt`, stopping at `eos`.
@@ -272,7 +294,7 @@ impl LlamaModel {
     }
 }
 
-/// Load a tensor as a freshly-allocated `f32` vector, dequantizing as needed.
+/// Load a small tensor (a norm) as a freshly-allocated `f32` vector.
 fn tensor_f32(model: &GgufModel, name: &str) -> Result<Vec<f32>> {
     let info = model
         .tensors
@@ -285,14 +307,48 @@ fn tensor_f32(model: &GgufModel, name: &str) -> Result<Vec<f32>> {
     ullm_core::dequant::dequantize(info.dtype, bytes, n)
 }
 
-/// `y[o] = sum_i w[o*in + i] * x[i]`, with `w` stored row-major as `[out, in]`.
-fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
-    (0..out_dim)
+/// Load a weight matrix, keeping its quantized bytes (a copy of the mmap slice).
+fn qweight(model: &GgufModel, name: &str) -> Result<QWeight> {
+    let info = model
+        .tensors
+        .get(name)
+        .ok_or_else(|| Error::Format(format!("missing tensor '{name}'")))?;
+    let (out, cols) = match info.shape.as_slice() {
+        [o, c] => (*o, *c),
+        [c] => (1, *c),
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "weight '{name}' has rank {}",
+                info.shape.len()
+            )));
+        }
+    };
+    let bytes = model
+        .tensor_data(name)
+        .ok_or_else(|| Error::Format(format!("no data for tensor '{name}'")))?;
+    Ok(QWeight {
+        data: bytes.to_vec(),
+        dtype: info.dtype,
+        out,
+        cols,
+    })
+}
+
+/// `y[o] = sum_i W[o, i] * x[i]`, dequantizing each row of `w` on the fly into a
+/// per-thread reused buffer. Memory-bound work, parallel over output rows.
+fn matvec_q(w: &QWeight, x: &[f32]) -> Vec<f32> {
+    let rb = w.row_bytes();
+    let cols = w.cols;
+    (0..w.out)
         .into_par_iter()
-        .map(|o| {
-            let row = &w[o * in_dim..o * in_dim + in_dim];
-            row.iter().zip(x).map(|(a, b)| a * b).sum()
-        })
+        .map_init(
+            || vec![0.0f32; cols],
+            |buf, o| {
+                ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], buf)
+                    .expect("dequantize weight row");
+                buf.iter().zip(x).map(|(a, b)| a * b).sum()
+            },
+        )
         .collect()
 }
 
@@ -434,9 +490,18 @@ mod tests {
     }
 
     #[test]
-    fn matvec_identity() {
-        let w = vec![1.0, 0.0, 0.0, 1.0];
-        assert_eq!(matvec(&w, &[3.0, 5.0], 2, 2), vec![3.0, 5.0]);
+    fn matvec_q_f32_identity() {
+        let data: Vec<u8> = [1.0f32, 0.0, 0.0, 1.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let w = QWeight {
+            data,
+            dtype: DType::F32,
+            out: 2,
+            cols: 2,
+        };
+        assert_eq!(matvec_q(&w, &[3.0, 5.0]), vec![3.0, 5.0]);
     }
 
     #[test]
