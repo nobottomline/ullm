@@ -1,20 +1,13 @@
 [package]
-name = "ullm-cli"
+name = "ullm-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Command-line interface for the uLLM inference engine."
-
-[[bin]]
-name = "ullm"
-path = "src/main.rs"
+description = "CPU reference runtime (Llama architecture) for the uLLM inference engine."
 
 [dependencies]
 ullm-core = { workspace = true }
 ullm-gguf = { workspace = true }
-ullm-tokenizer = { workspace = true }
-ullm-model = { workspace = true }
-clap = { workspace = true }

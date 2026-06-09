@@ -1,10 +1,12 @@
 //! `ullm` — the universal LLM inference engine command-line interface.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use ullm_core::device::Hardware;
 use ullm_gguf::GgufModel;
+use ullm_model::LlamaModel;
 
 #[derive(Parser)]
 #[command(name = "ullm", version, about = "Universal LLM inference engine")]
@@ -29,8 +31,16 @@ enum Command {
         /// Text to tokenize.
         text: String,
     },
-    /// Run a model (not yet implemented — see docs/roadmap.md).
-    Run,
+    /// Generate text from a prompt (greedy decoding on CPU).
+    Run {
+        /// Path to a `.gguf` model file.
+        path: PathBuf,
+        /// The prompt text.
+        prompt: String,
+        /// Maximum number of new tokens to generate.
+        #[arg(long, default_value_t = 64)]
+        max_tokens: usize,
+    },
     /// Start an OpenAI-compatible server (not yet implemented).
     Serve,
 }
@@ -41,7 +51,12 @@ fn main() {
         Command::Doctor => doctor(),
         Command::Inspect { path } => inspect(&path),
         Command::Tokenize { path, text } => tokenize(&path, &text),
-        Command::Run | Command::Serve => {
+        Command::Run {
+            path,
+            prompt,
+            max_tokens,
+        } => run(&path, &prompt, max_tokens),
+        Command::Serve => {
             eprintln!("not yet implemented — see docs/roadmap.md (Phase 0)");
             std::process::exit(1);
         }
@@ -82,6 +97,12 @@ fn inspect(path: &Path) {
     println!("  heads:         {} (kv {})", s.num_heads, s.num_kv_heads);
     println!("  vocab:         {}", s.vocab_size);
     println!("  tensors:       {}", model.tensors.len());
+
+    let mut dtypes: BTreeMap<String, usize> = BTreeMap::new();
+    for t in model.tensors.tensors.values() {
+        *dtypes.entry(format!("{:?}", t.dtype)).or_default() += 1;
+    }
+    println!("  dtypes:        {dtypes:?}");
 
     if let Some(tk) = model
         .metadata_get("tokenizer.ggml.model")
@@ -139,4 +160,35 @@ fn tokenize(path: &Path, text: &str) {
     println!("input:    {text:?}");
     println!("tokens:   {} -> {:?}", ids.len(), ids);
     println!("decoded:  {:?}", tk.decode(&ids));
+}
+
+fn run(path: &Path, prompt: &str, max_tokens: usize) {
+    let model = match GgufModel::open(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let tk = match model.tokenizer() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut lm = match LlamaModel::from_gguf(&model) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let prompt_ids = tk.encode(prompt, true);
+    let generated = lm.generate(&prompt_ids, max_tokens, tk.eos_id());
+
+    let mut full = prompt_ids.clone();
+    full.extend_from_slice(&generated);
+    println!("{}", tk.decode(&full));
 }

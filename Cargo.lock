@@ -173,6 +173,7 @@ dependencies = [
  "clap",
  "ullm-core",
  "ullm-gguf",
+ "ullm-model",
  "ullm-tokenizer",
 ]
 
@@ -187,6 +188,14 @@ dependencies = [
  "memmap2",
  "ullm-core",
  "ullm-tokenizer",
+]
+
+[[package]]
+name = "ullm-model"
+version = "0.0.0"
+dependencies = [
+ "ullm-core",
+ "ullm-gguf",
 ]
 
 [[package]]

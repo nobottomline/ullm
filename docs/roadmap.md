@@ -11,10 +11,10 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 - ☑ `ullm-cli`: `ullm doctor`
 - ☑ GGUF loader → `TensorBag` + `ModelSpec` (mmap, k-quant sizing, `ullm inspect`)
 - ☑ Tokenizer — SentencePiece/SPM from GGUF (`tokenizer.ggml.*`), byte fallback, `ullm tokenize`
-- ☐ CPU reference backend (correctness oracle, not speed)
-- ☐ Single forward pass of one small model (e.g. Qwen3-0.6B) — greedy decode
+- ☑ CPU reference backend — F32 matmul, RMSNorm, RoPE, GQA attention, SwiGLU
+- ☑ End-to-end forward pass + greedy decode (`ullm run`)
 
-**Exit:** load a real GGUF model and generate correct text on CPU.
+**Exit reached** — generates coherent text on stories260K (a real GGUF model).
 
 ## Phase 1 — Apple Silicon, fast
 

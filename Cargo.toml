@@ -6,6 +6,7 @@ members = [
     "crates/ullm-core",
     "crates/ullm-tokenizer",
     "crates/ullm-gguf",
+    "crates/ullm-model",
     "crates/ullm-cli",
 ]
 
@@ -22,6 +23,7 @@ homepage = "https://github.com/nobottomline/ullm"
 ullm-core = { path = "crates/ullm-core" }
 ullm-tokenizer = { path = "crates/ullm-tokenizer" }
 ullm-gguf = { path = "crates/ullm-gguf" }
+ullm-model = { path = "crates/ullm-model" }
 clap = { version = "4.5", features = ["derive"] }
 memmap2 = "0.9"
 
