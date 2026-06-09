@@ -1,19 +1,24 @@
 //! A minimal OpenAI-compatible HTTP server for uLLM.
 //!
-//! Phase 1: non-streaming `/v1/chat/completions` and `/v1/models`. One request
-//! is served at a time (a mutex around the model); continuous batching is a
-//! later phase.
+//! Phase 1: `/v1/chat/completions` (SSE streaming and non-streaming) and
+//! `/v1/models`. One request is served at a time (a mutex around the model);
+//! continuous batching is a later phase.
 
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     extract::State,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use ullm_core::{Error, Result};
 use ullm_gguf::GgufModel;
@@ -57,6 +62,33 @@ impl Engine {
                 .generate(&prompt_ids, max_tokens, self.tokenizer.eos_id(), params);
         let text = self.tokenizer.decode(&generated);
         (text, prompt_ids.len(), generated.len())
+    }
+
+    /// Stream the completion, invoking `on_delta` with each new text piece.
+    fn complete_stream<F: FnMut(&str)>(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        params: &SampleParams,
+        mut on_delta: F,
+    ) {
+        let prompt_ids = self.tokenizer.encode(prompt, true);
+        let eos = self.tokenizer.eos_id();
+        let mut all = prompt_ids.clone();
+        let mut sent = self.tokenizer.decode(&prompt_ids).len();
+        let tok = &self.tokenizer;
+        self.model
+            .generate_stream(&prompt_ids, max_tokens, eos, params, |id| {
+                all.push(id);
+                let full = tok.decode(&all);
+                if full.len() > sent {
+                    if let Some(delta) = full.get(sent..) {
+                        on_delta(delta);
+                        sent = full.len();
+                    }
+                }
+                true
+            });
     }
 }
 
@@ -143,6 +175,8 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(default)]
     seed: Option<u64>,
+    #[serde(default)]
+    stream: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -175,10 +209,7 @@ struct Usage {
     total_tokens: usize,
 }
 
-async fn chat_completions(
-    State(s): State<AppState>,
-    Json(req): Json<ChatRequest>,
-) -> Json<ChatResponse> {
+async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
     let prompt = build_prompt(&req.messages);
     let max_tokens = req.max_tokens.unwrap_or(128);
     let params = SampleParams {
@@ -187,6 +218,28 @@ async fn chat_completions(
         top_p: req.top_p.unwrap_or(1.0),
         seed: req.seed.unwrap_or(0),
     };
+    let model_id = s.model_id.clone();
+
+    if req.stream == Some(true) {
+        let (tx, rx) = mpsc::channel::<std::result::Result<Event, Infallible>>(64);
+        let engine = s.engine.clone();
+        let mid = model_id;
+        tokio::task::spawn_blocking(move || {
+            let send = |data: String| {
+                let _ = tx.blocking_send(Ok(Event::default().data(data)));
+            };
+            send(chunk_json(&mid, Some("assistant"), None, None));
+            {
+                let mut e = engine.lock().expect("engine mutex poisoned");
+                e.complete_stream(&prompt, max_tokens, &params, |delta| {
+                    send(chunk_json(&mid, None, Some(delta), None));
+                });
+            }
+            send(chunk_json(&mid, None, None, Some("stop")));
+            send("[DONE]".to_string());
+        });
+        return Sse::new(ReceiverStream::new(rx)).into_response();
+    }
 
     let engine = s.engine.clone();
     let (text, pt, ct) = tokio::task::spawn_blocking(move || {
@@ -200,7 +253,7 @@ async fn chat_completions(
         id: "chatcmpl-ullm".to_string(),
         object: "chat.completion",
         created: unix_now(),
-        model: s.model_id,
+        model: model_id,
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessage {
@@ -215,6 +268,56 @@ async fn chat_completions(
             total_tokens: pt + ct,
         },
     })
+    .into_response()
+}
+
+#[derive(Serialize)]
+struct ChatChunk {
+    id: &'static str,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Serialize)]
+struct ChunkChoice {
+    index: usize,
+    delta: Delta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Delta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+/// Serialize one OpenAI `chat.completion.chunk`.
+fn chunk_json(
+    model: &str,
+    role: Option<&str>,
+    content: Option<&str>,
+    finish: Option<&str>,
+) -> String {
+    let chunk = ChatChunk {
+        id: "chatcmpl-ullm",
+        object: "chat.completion.chunk",
+        created: unix_now(),
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: role.map(str::to_string),
+                content: content.map(str::to_string),
+            },
+            finish_reason: finish.map(str::to_string),
+        }],
+    };
+    serde_json::to_string(&chunk).unwrap_or_default()
 }
 
 /// Render chat messages into a Zephyr/TinyLlama-style prompt.

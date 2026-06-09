@@ -253,15 +253,17 @@ impl LlamaModel {
         matvec_q(&self.output, &x)
     }
 
-    /// Greedily generate up to `max_new` tokens after `prompt`, stopping at `eos`.
-    pub fn generate(
+    /// Generate tokens after `prompt`, invoking `on_token` for each new token.
+    /// Stops at EOS, `max_new`, the context limit, or when `on_token` returns
+    /// `false`.
+    pub fn generate_stream<F: FnMut(u32) -> bool>(
         &mut self,
         prompt: &[u32],
         max_new: usize,
         eos: Option<u32>,
         params: &SampleParams,
-    ) -> Vec<u32> {
-        let mut generated = Vec::new();
+        mut on_token: F,
+    ) {
         let mut pos = 0usize;
         let mut logits: Vec<f32> = Vec::new();
         let mut rng = if params.seed == 0 {
@@ -272,7 +274,7 @@ impl LlamaModel {
 
         for &tok in prompt {
             if pos >= self.config.n_ctx {
-                break;
+                return;
             }
             logits = self.forward(tok, pos);
             pos += 1;
@@ -283,14 +285,28 @@ impl LlamaModel {
                 break;
             }
             let next = sample_token(&logits, params, &mut rng);
-            if Some(next) == eos {
+            if Some(next) == eos || !on_token(next) {
                 break;
             }
-            generated.push(next);
             logits = self.forward(next, pos);
             pos += 1;
         }
-        generated
+    }
+
+    /// Collect generated token ids (a convenience wrapper over `generate_stream`).
+    pub fn generate(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        eos: Option<u32>,
+        params: &SampleParams,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.generate_stream(prompt, max_new, eos, params, |t| {
+            out.push(t);
+            true
+        });
+        out
     }
 }
 
