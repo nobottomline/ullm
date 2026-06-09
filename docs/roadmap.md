@@ -22,7 +22,7 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 - ☑ Metal backend — **full GPU forward** (weights/activations/KV resident, one command buffer per token), simdgroup k-quant matvec. `ullm run --gpu`, validated vs CPU by `ullm gpu-check` (rel ~3e-6 on all archs)
 - ☑ KV cache + sampling (greedy / temperature / top-k / top-p)
 - ☑ OpenAI-compatible server — `/v1/chat/completions` (SSE streaming + non-streaming) + `/v1/models` (`ullm serve`)
-- ◐ tokens/s benchmarks (M4 Max, decode): gemma-3-4b Q6_K **53.8 t/s** (CPU 2.7; llama.cpp Metal 110), Qwen2.5-1.5B Q4_K **160 t/s**, Llama-3.2-1B Q4_K **234 t/s**. Closing the gemma gap (matvec bandwidth) + startup-time benchmarks next
+- ☑ tokens/s benchmarks ([docs/benchmarks.md](benchmarks.md), M4 Max decode): gemma-3-4b Q6_K **80.5 t/s** (CPU 2.7; llama.cpp Metal 110 → 73%), Qwen2.5-1.5B Q4_K **190**, Llama-3.2-1B Q4_K **263**, Qwen3-4B BF16 **26.6**. Startup-time benchmarks still to add
 
 **Exit:** competitive single-Mac inference with best-in-class cold start.
 
