@@ -105,6 +105,120 @@ kernel void matvec_q6k(
     y[o] = acc;
 }
 
+// ---- simdgroup matvec: one simdgroup (32 lanes) cooperates on each output row,
+//      reducing with simd_sum. Much higher GPU utilization than one-thread-per-row.
+
+kernel void matvec_f32_sg(
+    device const float* w       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       y       [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint  tg   [[threadgroup_position_in_grid]],
+    uint  sgi  [[simdgroup_index_in_threadgroup]],
+    uint  sgs  [[simdgroups_per_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    uint o = tg * sgs + sgi;
+    float acc = 0.0f;
+    if (o < out_dim) {
+        device const float* row = w + (uint)o * in_dim;
+        for (uint i = lane; i < in_dim; i += 32u) acc += row[i] * x[i];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0 && o < out_dim) y[o] = acc;
+}
+
+kernel void matvec_q4k_sg(
+    device const uchar* w       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       y       [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint  tg   [[threadgroup_position_in_grid]],
+    uint  sgi  [[simdgroup_index_in_threadgroup]],
+    uint  sgs  [[simdgroups_per_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    uint o = tg * sgs + sgi;
+    float acc = 0.0f;
+    if (o < out_dim) {
+        uint blocks = in_dim / 256u;
+        device const uchar* base = w + (uint)o * blocks * 144u;
+        for (uint b = lane; b < blocks; b += 32u) {
+            device const uchar* blk = base + b * 144u;
+            float d    = (float)as_type<half>((ushort)(blk[0] | (blk[1] << 8)));
+            float dmin = (float)as_type<half>((ushort)(blk[2] | (blk[3] << 8)));
+            device const uchar* sc = blk + 4;
+            device const uchar* qs = blk + 16;
+            device const float* xb = x + b * 256u;
+            uint is = 0, qoff = 0, xoff = 0;
+            for (uint j = 0; j < 4; ++j) {
+                uchar s1, m1, s2, m2;
+                if (is < 4u)  { s1 = sc[is] & 63;  m1 = sc[is+4] & 63; }
+                else          { s1 = (sc[is+4] & 0xF) | ((sc[is-4] >> 6) << 4);
+                                m1 = (sc[is+4] >> 4)  | ((sc[is]   >> 6) << 4); }
+                uint is2 = is + 1;
+                if (is2 < 4u) { s2 = sc[is2] & 63; m2 = sc[is2+4] & 63; }
+                else          { s2 = (sc[is2+4] & 0xF) | ((sc[is2-4] >> 6) << 4);
+                                m2 = (sc[is2+4] >> 4)  | ((sc[is2]   >> 6) << 4); }
+                float d1 = d * (float)s1, mm1 = dmin * (float)m1;
+                float d2 = d * (float)s2, mm2 = dmin * (float)m2;
+                for (uint l = 0; l < 32; ++l)
+                    acc += (d1 * (float)(qs[qoff+l] & 0xF) - mm1) * xb[xoff + l];
+                for (uint l = 0; l < 32; ++l)
+                    acc += (d2 * (float)(qs[qoff+l] >> 4) - mm2) * xb[xoff + 32 + l];
+                qoff += 32; xoff += 64; is += 2;
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0 && o < out_dim) y[o] = acc;
+}
+
+kernel void matvec_q6k_sg(
+    device const uchar* w       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       y       [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    uint  tg   [[threadgroup_position_in_grid]],
+    uint  sgi  [[simdgroup_index_in_threadgroup]],
+    uint  sgs  [[simdgroups_per_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    uint o = tg * sgs + sgi;
+    float acc = 0.0f;
+    if (o < out_dim) {
+        uint blocks = in_dim / 256u;
+        device const uchar* base = w + (uint)o * blocks * 210u;
+        for (uint b = lane; b < blocks; b += 32u) {
+            device const uchar* blk = base + b * 210u;
+            device const uchar* ql = blk;
+            device const uchar* qh = blk + 128;
+            device const char*  sc = (device const char*)(blk + 192);
+            float d = (float)as_type<half>((ushort)(blk[208] | (blk[209] << 8)));
+            device const float* xb = x + b * 256u;
+            for (uint nh = 0; nh < 2; ++nh) {
+                uint qlo = nh*64u, qho = nh*32u, sco = nh*8u, yo = nh*128u;
+                for (uint l = 0; l < 32; ++l) {
+                    uint is = l / 16u;
+                    int q1 = (int)((ql[qlo+l]    & 0xF) | ((int)(qh[qho+l]       & 3) << 4)) - 32;
+                    int q2 = (int)((ql[qlo+l+32] & 0xF) | ((int)((qh[qho+l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int)((ql[qlo+l]    >> 4) | ((int)((qh[qho+l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int)((ql[qlo+l+32] >> 4) | ((int)((qh[qho+l] >> 6) & 3) << 4)) - 32;
+                    acc += d * (float)sc[sco+is]   * (float)q1 * xb[yo + l];
+                    acc += d * (float)sc[sco+is+2] * (float)q2 * xb[yo + l + 32];
+                    acc += d * (float)sc[sco+is+4] * (float)q3 * xb[yo + l + 64];
+                    acc += d * (float)sc[sco+is+6] * (float)q4 * xb[yo + l + 96];
+                }
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0 && o < out_dim) y[o] = acc;
+}
+
 // ---- Full-forward kernels (activations resident on the GPU) ----
 
 // RMSNorm over `n` elements with a per-channel gain. `y` may alias `x`.

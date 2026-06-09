@@ -214,9 +214,9 @@ impl GpuForward {
         let alloc = |n: usize| device.new_buffer((n * 4) as u64, SHARED);
 
         Ok(Self {
-            p_matvec_f32: pso("matvec")?,
-            p_matvec_q4k: pso("matvec_q4k")?,
-            p_matvec_q6k: pso("matvec_q6k")?,
+            p_matvec_f32: pso("matvec_f32_sg")?,
+            p_matvec_q4k: pso("matvec_q4k_sg")?,
+            p_matvec_q6k: pso("matvec_q6k_sg")?,
             p_rmsnorm: pso("rmsnorm")?,
             p_rmsnorm_heads: pso("rmsnorm_heads")?,
             p_rope_neox: pso("rope_neox")?,
@@ -459,8 +459,14 @@ impl GpuForward {
         enc.set_buffer(1, Some(x), 0);
         enc.set_buffer(2, Some(y), y_off);
         let in_dim = w.cols as u32;
+        let out_dim = w.out as u32;
         enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
-        dispatch_1d(enc, pso, w.out as u64);
+        enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
+        // One simdgroup (32 lanes) per output row; 8 simdgroups per threadgroup.
+        const THREADS: u64 = 256;
+        let sgs = THREADS / 32;
+        let groups = (w.out as u64).div_ceil(sgs);
+        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
     }
 
     #[allow(clippy::too_many_arguments)]
