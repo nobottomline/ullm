@@ -46,4 +46,34 @@ impl DType {
     pub fn is_quantized(self) -> bool {
         !matches!(self, DType::F32 | DType::F16 | DType::BF16)
     }
+
+    /// Number of weights stored per block.
+    pub fn block_size(self) -> usize {
+        use DType::*;
+        match self {
+            F32 | F16 | BF16 => 1,
+            Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 => 32,
+            Q2K | Q3K | Q4K | Q5K | Q6K | Q8K => 256,
+        }
+    }
+
+    /// Size in bytes of one stored block.
+    pub fn type_size(self) -> usize {
+        use DType::*;
+        match self {
+            F32 => 4,
+            F16 | BF16 => 2,
+            Q4_0 => 18,
+            Q4_1 => 20,
+            Q5_0 => 22,
+            Q5_1 => 24,
+            Q8_0 => 34,
+            Q2K => 84,
+            Q3K => 110,
+            Q4K => 144,
+            Q5K => 176,
+            Q6K => 210,
+            Q8K => 292,
+        }
+    }
 }

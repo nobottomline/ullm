@@ -111,6 +111,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -157,11 +172,20 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "ullm-core",
+ "ullm-gguf",
 ]
 
 [[package]]
 name = "ullm-core"
 version = "0.0.0"
+
+[[package]]
+name = "ullm-gguf"
+version = "0.0.0"
+dependencies = [
+ "memmap2",
+ "ullm-core",
+]
 
 [[package]]
 name = "unicode-ident"
