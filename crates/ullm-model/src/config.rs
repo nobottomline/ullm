@@ -7,6 +7,8 @@ pub enum Arch {
     Llama,
     /// Qwen2 / Qwen2.5 — adds Q/K/V attention biases.
     Qwen2,
+    /// Qwen3 — per-head Q/K RMSNorm before RoPE, no attention bias.
+    Qwen3,
     /// Gemma 3 — `sqrt(n_embd)`-scaled embeddings, Q/K-norm, sandwich
     /// (post-attention / post-FFN) RMSNorms, GeGLU, and NeoX-style RoPE.
     /// Note: the GGUF converter folds Gemma's `(1 + w)` norm gain into the

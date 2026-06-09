@@ -317,28 +317,21 @@ fn tokenize(path: &Path, text: &str) {
 }
 
 fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams) {
-    let model = match GgufModel::open(path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
+    let exit = |e| -> ! {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     };
-    let tk = match model.tokenizer() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
+    let (tk, mut lm) = if is_safetensors(path) {
+        let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
+        let tk = load_hf_tokenizer(path);
+        let lm = LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e));
+        (tk, lm) // `st`'s mmap drops here; `lm` owns copied weights
+    } else {
+        let model = GgufModel::open(path).unwrap_or_else(|e| exit(e));
+        let tk = model.tokenizer().unwrap_or_else(|e| exit(e));
+        let lm = LlamaModel::from_gguf(&model).unwrap_or_else(|e| exit(e));
+        (tk, lm)
     };
-    let mut lm = match LlamaModel::from_gguf(&model) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
-    drop(model); // weights are now owned by `lm`; release the mmap
 
     let prompt_ids = tk.encode(prompt, true);
     let generated = lm.generate(&prompt_ids, max_tokens, tk.eos_id(), &params);
