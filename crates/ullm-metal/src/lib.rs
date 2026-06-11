@@ -824,10 +824,11 @@ kernel void attn_scores(
     constant uint&      stride   [[buffer(6)]],  // scores row stride (n_ctx)
     constant float&     scale    [[buffer(7)]],
     constant uint&      seqlen   [[buffer(8)]],
+    constant uint&      start    [[buffer(9)]],  // sliding-window first key
     uint2 gid [[thread_position_in_grid]])       // x = t, y = h
 {
     uint t = gid.x, h = gid.y;
-    if (t >= seqlen) return;
+    if (t < start || t >= seqlen) return;
     uint kvh = h / kv_mul;
     device const float* qh = q + h * head_dim;
     device const float* kt = kcache + t * kv_dim + kvh * head_dim;
@@ -841,6 +842,7 @@ kernel void attn_softmax(
     device float*  scores [[buffer(0)]],
     constant uint& stride [[buffer(1)]],
     constant uint& seqlen [[buffer(2)]],
+    constant uint& start  [[buffer(3)]],
     uint h   [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint nt  [[threads_per_threadgroup]])
@@ -848,7 +850,7 @@ kernel void attn_softmax(
     device float* row = scores + h * stride;
     threadgroup float sh[1024];
     float m = -INFINITY;
-    for (uint t = tid; t < seqlen; t += nt) m = max(m, row[t]);
+    for (uint t = start + tid; t < seqlen; t += nt) m = max(m, row[t]);
     sh[tid] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = nt / 2u; s > 0u; s >>= 1) {
@@ -858,7 +860,7 @@ kernel void attn_softmax(
     float mx = sh[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float sum = 0.0f;
-    for (uint t = tid; t < seqlen; t += nt) { float e = exp(row[t] - mx); row[t] = e; sum += e; }
+    for (uint t = start + tid; t < seqlen; t += nt) { float e = exp(row[t] - mx); row[t] = e; sum += e; }
     sh[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = nt / 2u; s > 0u; s >>= 1) {
@@ -866,7 +868,7 @@ kernel void attn_softmax(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float inv = 1.0f / sh[0];
-    for (uint t = tid; t < seqlen; t += nt) row[t] *= inv;
+    for (uint t = start + tid; t < seqlen; t += nt) row[t] *= inv;
 }
 
 // Attention output: out[h,d] = sum_t scores[h,t] * V[t, kvh, d].
@@ -879,6 +881,7 @@ kernel void attn_output(
     constant uint&      kv_mul   [[buffer(5)]],
     constant uint&      stride   [[buffer(6)]],
     constant uint&      seqlen   [[buffer(7)]],
+    constant uint&      start    [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]])       // x = d, y = h
 {
     uint d = gid.x, h = gid.y;
@@ -886,7 +889,7 @@ kernel void attn_output(
     uint kvh = h / kv_mul;
     device const float* row = scores + h * stride;
     float acc = 0.0f;
-    for (uint t = 0; t < seqlen; ++t) acc += row[t] * vcache[t * kv_dim + kvh * head_dim + d];
+    for (uint t = start; t < seqlen; ++t) acc += row[t] * vcache[t * kv_dim + kvh * head_dim + d];
     out[h * head_dim + d] = acc;
 }
 

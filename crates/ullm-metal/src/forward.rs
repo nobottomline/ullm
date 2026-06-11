@@ -46,6 +46,8 @@ pub struct GpuParams {
     pub n_experts_used: usize,
     /// Per-expert feed-forward width.
     pub moe_inter: usize,
+    /// Sliding-window span (0 = full attention); Gemma local layers use it.
+    pub sliding_window: usize,
 }
 
 /// A weight matrix to upload: raw (possibly quantized) bytes plus its shape.
@@ -419,10 +421,15 @@ impl GpuForward {
             self.rope(enc, rope_pso, &self.q, 0, p.n_head as u32, pos as u32);
             self.rope(enc, rope_pso, &self.key_cache, kv_pos_off, p.n_kv_head as u32, pos as u32);
 
-            // attention
-            self.attn_scores(enc, kv_layer_off, kv_mul, scale, seqlen);
-            self.attn_softmax(enc, seqlen);
-            self.attn_output(enc, kv_layer_off, kv_mul, seqlen);
+            // attention (Gemma local layers use a sliding window; every 6th is full)
+            let attn_start = if p.sliding_window > 0 && l % 6 != 5 && pos + 1 > p.sliding_window {
+                (pos + 1 - p.sliding_window) as u32
+            } else {
+                0
+            };
+            self.attn_scores(enc, kv_layer_off, kv_mul, scale, seqlen, attn_start);
+            self.attn_softmax(enc, seqlen, attn_start);
+            self.attn_output(enc, kv_layer_off, kv_mul, seqlen, attn_start);
 
             // output projection into xb (n_embd), optional post-norm, residual
             self.matvec(enc, &lw.wo, &self.attn, &self.xb, 0);
@@ -539,10 +546,10 @@ impl GpuForward {
         check(&self.q, 0, q_dim, "rope_q");
         run(&|e| self.rope(e, rope_pso, &self.key_cache, kv_pos_off, p.n_kv_head as u32, pos as u32));
         check(&self.key_cache, kv_pos_off, kv_dim, "rope_k");
-        run(&|e| self.attn_scores(e, 0, kv_mul, scale, seqlen));
+        run(&|e| self.attn_scores(e, 0, kv_mul, scale, seqlen, 0));
         check(&self.scores, 0, (p.n_head * seqlen as usize).min(p.n_head * p.n_ctx), "attn_scores");
-        run(&|e| self.attn_softmax(e, seqlen));
-        run(&|e| self.attn_output(e, 0, kv_mul, seqlen));
+        run(&|e| self.attn_softmax(e, seqlen, 0));
+        run(&|e| self.attn_output(e, 0, kv_mul, seqlen, 0));
         check(&self.attn, 0, q_dim, "attn_out");
         run(&|e| self.matvec(e, &lw.wo, &self.attn, &self.xb, 0));
         check(&self.xb, 0, p.n_embd, "wo");
@@ -736,6 +743,7 @@ impl GpuForward {
         kv_mul: u32,
         scale: f32,
         seqlen: u32,
+        start: u32,
     ) {
         enc.set_compute_pipeline_state(&self.p_attn_scores);
         enc.set_buffer(0, Some(&self.q), 0);
@@ -750,17 +758,19 @@ impl GpuForward {
         enc.set_bytes(6, 4, (&stride as *const u32).cast());
         enc.set_bytes(7, 4, (&scale as *const f32).cast());
         enc.set_bytes(8, 4, (&seqlen as *const u32).cast());
+        enc.set_bytes(9, 4, (&start as *const u32).cast());
         let nh = self.p.n_head as u64;
         let tg = (seqlen as u64).clamp(1, 64);
         enc.dispatch_threads(MTLSize::new(seqlen as u64, nh, 1), MTLSize::new(tg, 1, 1));
     }
 
-    fn attn_softmax(&self, enc: &ComputeCommandEncoderRef, seqlen: u32) {
+    fn attn_softmax(&self, enc: &ComputeCommandEncoderRef, seqlen: u32, start: u32) {
         enc.set_compute_pipeline_state(&self.p_attn_softmax);
         enc.set_buffer(0, Some(&self.scores), 0);
         let stride = self.p.n_ctx as u32;
         enc.set_bytes(1, 4, (&stride as *const u32).cast());
         enc.set_bytes(2, 4, (&seqlen as *const u32).cast());
+        enc.set_bytes(3, 4, (&start as *const u32).cast());
         let nh = self.p.n_head as u64;
         enc.dispatch_thread_groups(MTLSize::new(nh, 1, 1), MTLSize::new(REDUCE_NT, 1, 1));
     }
@@ -771,6 +781,7 @@ impl GpuForward {
         kv_layer_off: u64,
         kv_mul: u32,
         seqlen: u32,
+        start: u32,
     ) {
         enc.set_compute_pipeline_state(&self.p_attn_output);
         enc.set_buffer(0, Some(&self.scores), 0);
@@ -784,6 +795,7 @@ impl GpuForward {
         enc.set_bytes(5, 4, (&kv_mul as *const u32).cast());
         enc.set_bytes(6, 4, (&stride as *const u32).cast());
         enc.set_bytes(7, 4, (&seqlen as *const u32).cast());
+        enc.set_bytes(8, 4, (&start as *const u32).cast());
         let nh = self.p.n_head as u64;
         let hd64 = self.p.head_dim as u64;
         let tg = hd64.clamp(1, 256);

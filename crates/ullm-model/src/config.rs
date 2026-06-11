@@ -38,4 +38,8 @@ pub struct LlamaConfig {
     pub n_experts_used: usize,
     /// Per-expert feed-forward width.
     pub moe_inter: usize,
+    /// Sliding-window attention span (0 = full attention on every layer). For
+    /// Gemma-3, local layers attend to the last `sliding_window` tokens and
+    /// every 6th layer uses full attention.
+    pub sliding_window: usize,
 }

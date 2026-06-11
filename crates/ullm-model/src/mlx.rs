@@ -155,6 +155,7 @@ impl LlamaModel {
             n_experts,
             n_experts_used,
             moe_inter,
+            sliding_window: 0,
         };
 
         let tok_embeddings = mlx_qweight(st, "model.embed_tokens", gs)?;

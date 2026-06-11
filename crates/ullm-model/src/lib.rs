@@ -140,6 +140,12 @@ impl LlamaModel {
         let rope_theta = opt_f("rope.freq_base").unwrap_or(10000.0);
         let eps = opt_f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let vocab_size = model.model_spec().vocab_size as usize;
+        // Gemma-3 uses sliding-window attention on its local layers.
+        let sliding_window = if arch == Arch::Gemma3 {
+            opt_u("attention.sliding_window").unwrap_or(1024) as usize
+        } else {
+            0
+        };
 
         let config = LlamaConfig {
             arch,
@@ -156,6 +162,7 @@ impl LlamaModel {
             n_experts: 0,
             n_experts_used: 0,
             moe_inter: 0,
+            sliding_window,
         };
 
         let tok_embeddings = qweight(model, "token_embd.weight")?;
@@ -263,6 +270,7 @@ impl LlamaModel {
             n_experts: 0,
             n_experts_used: 0,
             moe_inter: 0,
+            sliding_window: 0,
         };
 
         let tok_embeddings = qweight(model, "model.embed_tokens.weight")?;
@@ -396,6 +404,7 @@ impl LlamaModel {
             n_experts: c.n_experts,
             n_experts_used: c.n_experts_used,
             moe_inter: c.moe_inter,
+            sliding_window: c.sliding_window,
         };
         fn gw(w: &QWeight) -> GpuWeight<'_> {
             GpuWeight {
@@ -592,6 +601,7 @@ impl LlamaModel {
         let n_kv_head = c.n_kv_head;
         let eps = c.eps;
         let rope_theta = c.rope_theta;
+        let sliding_window = c.sliding_window;
         let scale = (head_dim as f32).sqrt().recip();
 
         // Embedding (with Gemma's sqrt(n_embd) scale) is computed in `embed`.
@@ -631,11 +641,18 @@ impl LlamaModel {
             self.key_cache[off..off + kv_dim].copy_from_slice(&k);
             self.val_cache[off..off + kv_dim].copy_from_slice(&v);
 
+            // Gemma local layers (every 6th is global) use sliding-window
+            // attention: only the most recent `sliding_window` keys are visible.
+            let attn_start = if sliding_window > 0 && l % 6 != 5 && pos + 1 > sliding_window {
+                pos + 1 - sliding_window
+            } else {
+                0
+            };
             let mut att_out = vec![0.0f32; q_dim];
             for h in 0..n_head {
                 let kvh = h / kv_mul;
                 let qh = &q[h * head_dim..h * head_dim + head_dim];
-                let mut scores: Vec<f32> = (0..=pos)
+                let mut scores: Vec<f32> = (attn_start..=pos)
                     .map(|t| {
                         let ko = kv_base + t * kv_dim + kvh * head_dim;
                         let kt = &self.key_cache[ko..ko + head_dim];
@@ -644,7 +661,8 @@ impl LlamaModel {
                     .collect();
                 softmax(&mut scores);
                 let oo = h * head_dim;
-                for (t, &a) in scores.iter().enumerate() {
+                for (idx, &a) in scores.iter().enumerate() {
+                    let t = attn_start + idx;
                     let vo = kv_base + t * kv_dim + kvh * head_dim;
                     let vt = &self.val_cache[vo..vo + head_dim];
                     for (dst, &vv) in att_out[oo..oo + head_dim].iter_mut().zip(vt) {
