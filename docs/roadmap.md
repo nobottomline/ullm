@@ -36,9 +36,27 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 
 - ☑ Byte-level BPE tokenizer — runs the Llama-3 / GPT-2 / Qwen family (verified on Llama-3.2-1B)
 - ☑ Qwen2 architecture (Q/K/V attention bias) — verified on Qwen2.5-1.5B-Instruct
-- ☑ Gemma 3 architecture (scaled embeddings, Q/K-norm, sandwich norms, GeGLU, NeoX RoPE) — verified on gemma-3-4b Q6_K vs llama.cpp
+- ☑ Gemma 3 architecture (scaled embeddings, Q/K-norm, sandwich norms, GeGLU, NeoX RoPE, **sliding-window attention** on local layers) — verified on gemma-3-4b Q6_K vs llama.cpp
 - ☑ Qwen3 architecture (per-head Q/K-norm, NeoX RoPE, tied embeddings) — runs from SafeTensors
 - ◐ SafeTensors / Hugging Face loader — `WeightSource` trait unifies GGUF + SafeTensors; loads single-file and sharded BF16/F16/F32 models + `tokenizer.json`; runs Qwen3-4B end-to-end. PyTorch `.bin` loader still TODO
 - ☑ Apple MLX loader (4-bit group quant) + Qwen3-MoE (top-k router, stacked experts) — runs Qwen3-Coder-30B-A3B-MLX, validated token-for-token vs mlx_lm. GPU MoE (router top-k + expert dispatch in one command buffer): **22.7 tok/s** on M4 Max (vs 0.9 CPU)
 - ☐ Vulkan and CUDA backends
 - ☐ Data-driven (block-composed) model definitions
+
+## Known limitations (honest)
+
+These are real today — being explicit so nobody is surprised:
+
+- **Prompt prefill is token-by-token.** A long prompt (RAG, a pasted
+  document) is processed one position at a time, so time-to-first-token grows
+  linearly with prompt length. Batched/parallel prefill is the planned fix.
+- **Single request at a time.** The server serializes requests (one mutex
+  around the model); no continuous batching yet. Fine for single-Mac local use,
+  not for multi-user serving.
+- **Context capped at 8192** tokens (KV cache sizing); larger contexts are not
+  yet supported.
+- **Apple Silicon / Metal only** for the GPU path. CPU works everywhere but is
+  the slow reference, not the product.
+- **Not all architectures / quants.** Dense Llama/Qwen2/Qwen3/Gemma-3 + Qwen3
+  MoE; Q4_K/Q5_K/Q6_K + legacy GGUF quants + MLX 4-bit + BF16/F16. Other
+  k-quants (IQ-*), PyTorch `.bin`, and many architectures are not done.
