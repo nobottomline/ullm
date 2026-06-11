@@ -19,7 +19,9 @@ use ullm_safetensors::SafeTensorsModel;
 pub use config::{Arch, LlamaConfig};
 pub use sample::SampleParams;
 
-use math::{add_bias, dequant_mlx_row, gelu, matvec_q, rmsnorm, rope, rope_neox, silu, softmax};
+use math::{
+    add_bias, dequant_mlx_row, gelu, matmul_q, matvec_q, rmsnorm, rope, rope_neox, silu, softmax,
+};
 use sample::sample_token;
 use weights::{qweight, tensor_f32};
 
@@ -587,6 +589,158 @@ impl LlamaModel {
         matvec_q(&self.output, &x)
     }
 
+    /// Batched prefill for the Llama family (Llama / Qwen2 / Qwen3 / Qwen3-MoE):
+    /// run all `tokens` (at positions `start_pos .. start_pos + tokens.len()`)
+    /// through ONE forward, reading each attention/FFN weight only once via
+    /// `matmul_q` instead of once per token. Fills the KV cache for every
+    /// position and returns the LAST token's logits (all a sampler needs).
+    ///
+    /// Numerically identical to calling [`forward_llama`] token-by-token — the
+    /// causal mask is exactly the per-token `0..=pos` score window, so position
+    /// `s` never sees a future key. Gemma (sandwich norms / sliding window) and
+    /// the GPU path keep their own token-by-token routes.
+    fn forward_batch(&mut self, tokens: &[u32], start_pos: usize) -> Vec<f32> {
+        let use_neox = self.rope_neox;
+        let c = &self.config;
+        let head_dim = c.head_dim;
+        let kv_dim = c.n_kv_head * head_dim;
+        let q_dim = c.n_head * head_dim;
+        let kv_mul = c.n_head / c.n_kv_head;
+        let n_ctx = c.n_ctx;
+        let n_layer = c.n_layer;
+        let n_head = c.n_head;
+        let n_kv_head = c.n_kv_head;
+        let n_embd = c.n_embd;
+        let eps = c.eps;
+        let rope_theta = c.rope_theta;
+        let n_used = c.n_experts_used;
+        let scale = (head_dim as f32).sqrt().recip();
+        let s_len = tokens.len();
+
+        // Token-major activations: row `s` is `x[s * n_embd .. (s + 1) * n_embd]`.
+        let mut x = vec![0.0f32; s_len * n_embd];
+        for (s, &tok) in tokens.iter().enumerate() {
+            x[s * n_embd..(s + 1) * n_embd].copy_from_slice(&self.embed(tok));
+        }
+
+        for l in 0..n_layer {
+            let lw = &self.layers[l];
+
+            // --- attention: norm -> Q/K/V (batched matmul) ---
+            let mut xb = vec![0.0f32; s_len * n_embd];
+            for s in 0..s_len {
+                let n = rmsnorm(&x[s * n_embd..(s + 1) * n_embd], &lw.attn_norm, eps);
+                xb[s * n_embd..(s + 1) * n_embd].copy_from_slice(&n);
+            }
+            let mut q = matmul_q(&lw.wq, &xb, s_len);
+            let mut k = matmul_q(&lw.wk, &xb, s_len);
+            let mut v = matmul_q(&lw.wv, &xb, s_len);
+
+            // Per-token bias, Q/K-norm, RoPE, then write the KV cache for every
+            // position BEFORE any attention reads it.
+            for s in 0..s_len {
+                let pos = start_pos + s;
+                let qs = &mut q[s * q_dim..s * q_dim + q_dim];
+                let ks = &mut k[s * kv_dim..s * kv_dim + kv_dim];
+                let vs = &mut v[s * kv_dim..s * kv_dim + kv_dim];
+                if let Some(b) = &lw.q_bias {
+                    add_bias(qs, b);
+                }
+                if let Some(b) = &lw.k_bias {
+                    add_bias(ks, b);
+                }
+                if let Some(b) = &lw.v_bias {
+                    add_bias(vs, b);
+                }
+                if let Some(qn) = &lw.q_norm {
+                    for h in 0..n_head {
+                        let hs = h * head_dim;
+                        let normed = rmsnorm(&qs[hs..hs + head_dim], qn, eps);
+                        qs[hs..hs + head_dim].copy_from_slice(&normed);
+                    }
+                }
+                if let Some(kn) = &lw.k_norm {
+                    for h in 0..n_kv_head {
+                        let hs = h * head_dim;
+                        let normed = rmsnorm(&ks[hs..hs + head_dim], kn, eps);
+                        ks[hs..hs + head_dim].copy_from_slice(&normed);
+                    }
+                }
+                if use_neox {
+                    rope_neox(qs, n_head, head_dim, pos, rope_theta);
+                    rope_neox(ks, n_kv_head, head_dim, pos, rope_theta);
+                } else {
+                    rope(qs, n_head, head_dim, pos, rope_theta);
+                    rope(ks, n_kv_head, head_dim, pos, rope_theta);
+                }
+                let off = l * n_ctx * kv_dim + pos * kv_dim;
+                self.key_cache[off..off + kv_dim].copy_from_slice(ks);
+                self.val_cache[off..off + kv_dim].copy_from_slice(vs);
+            }
+
+            // Causal attention per token: query `pos` attends to keys `0..=pos`.
+            let mut att_out = vec![0.0f32; s_len * q_dim];
+            for s in 0..s_len {
+                let pos = start_pos + s;
+                let qrow = &q[s * q_dim..s * q_dim + q_dim];
+                let orow = &mut att_out[s * q_dim..s * q_dim + q_dim];
+                for h in 0..n_head {
+                    let kvh = h / kv_mul;
+                    let qh = &qrow[h * head_dim..h * head_dim + head_dim];
+                    let mut scores: Vec<f32> = (0..=pos)
+                        .map(|t| {
+                            let ko = l * n_ctx * kv_dim + t * kv_dim + kvh * head_dim;
+                            let kt = &self.key_cache[ko..ko + head_dim];
+                            qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale
+                        })
+                        .collect();
+                    softmax(&mut scores);
+                    let oo = h * head_dim;
+                    for (t, &a) in scores.iter().enumerate() {
+                        let vo = l * n_ctx * kv_dim + t * kv_dim + kvh * head_dim;
+                        let vt = &self.val_cache[vo..vo + head_dim];
+                        for (dst, &vv) in orow[oo..oo + head_dim].iter_mut().zip(vt) {
+                            *dst += a * vv;
+                        }
+                    }
+                }
+            }
+
+            let attn = matmul_q(&lw.wo, &att_out, s_len);
+            for (xi, ai) in x.iter_mut().zip(&attn) {
+                *xi += ai;
+            }
+
+            // --- feed-forward (SwiGLU, or per-token mixture-of-experts) ---
+            let mut xb2 = vec![0.0f32; s_len * n_embd];
+            for s in 0..s_len {
+                let n = rmsnorm(&x[s * n_embd..(s + 1) * n_embd], &lw.ffn_norm, eps);
+                xb2[s * n_embd..(s + 1) * n_embd].copy_from_slice(&n);
+            }
+            let down = if let Some(gate_w) = &lw.moe_gate {
+                let mut d = vec![0.0f32; s_len * n_embd];
+                for s in 0..s_len {
+                    let o = moe_ffn(lw, gate_w, &xb2[s * n_embd..(s + 1) * n_embd], n_used);
+                    d[s * n_embd..(s + 1) * n_embd].copy_from_slice(&o);
+                }
+                d
+            } else {
+                let gate = matmul_q(&lw.w_gate, &xb2, s_len);
+                let up = matmul_q(&lw.w_up, &xb2, s_len);
+                let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
+                matmul_q(&lw.w_down, &hidden, s_len)
+            };
+            for (xi, di) in x.iter_mut().zip(&down) {
+                *xi += di;
+            }
+        }
+
+        // Only the last token's logits matter for the next sample.
+        let last = (s_len - 1) * n_embd;
+        let xf = rmsnorm(&x[last..last + n_embd], &self.final_norm, eps);
+        matvec_q(&self.output, &xf)
+    }
+
     /// Gemma-3 forward: scaled embeddings, `(1+w)` RMSNorm, per-head Q/K-norm,
     /// NeoX RoPE, GeGLU, and sandwich (post-attention / post-FFN) norms. Sliding
     /// window attention is treated as full attention (correct for short context).
@@ -717,12 +871,22 @@ impl LlamaModel {
             params.seed
         };
 
-        for &tok in prompt {
-            if pos >= self.config.n_ctx {
-                return;
+        // Prefill: on CPU for the Llama family, run the whole prompt through one
+        // batched forward (each weight read once) instead of token-by-token. The
+        // GPU path and Gemma keep their per-token routes.
+        let batched = !self.gpu_enabled() && self.config.arch != Arch::Gemma3;
+        if batched && !prompt.is_empty() {
+            let take = prompt.len().min(self.config.n_ctx);
+            logits = self.forward_batch(&prompt[..take], 0);
+            pos = take;
+        } else {
+            for &tok in prompt {
+                if pos >= self.config.n_ctx {
+                    return;
+                }
+                logits = self.forward(tok, pos);
+                pos += 1;
             }
-            logits = self.forward(tok, pos);
-            pos += 1;
         }
 
         for _ in 0..max_new {
@@ -753,6 +917,57 @@ impl LlamaModel {
         });
         out
     }
+
+    /// Debug: run `prompt` through the batched prefill and the token-by-token
+    /// CPU forward, then compare the final-position logits. They must be
+    /// numerically identical up to floating-point reduction order. Also times
+    /// both paths to surface the batched-prefill speedup.
+    pub fn prefill_check(&mut self, prompt: &[u32]) -> PrefillCheck {
+        let t0 = std::time::Instant::now();
+        let lb = self.forward_batch(prompt, 0);
+        let batch_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t1 = std::time::Instant::now();
+        let mut ls = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            ls = self.forward_llama(tok, pos);
+        }
+        let seq_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        let max_diff = lb
+            .iter()
+            .zip(&ls)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv { (i, x) } else { (bi, bv) }
+                })
+                .0 as u32
+        };
+        let (batch_argmax, seq_argmax) = (argmax(&lb), argmax(&ls));
+        PrefillCheck {
+            max_diff,
+            agree: batch_argmax == seq_argmax,
+            batch_argmax,
+            seq_argmax,
+            batch_ms,
+            seq_ms,
+        }
+    }
+}
+
+/// Result of [`LlamaModel::prefill_check`]: a correctness comparison plus the
+/// wall-clock time of each prefill path.
+pub struct PrefillCheck {
+    pub max_diff: f32,
+    pub agree: bool,
+    pub batch_argmax: u32,
+    pub seq_argmax: u32,
+    pub batch_ms: f64,
+    pub seq_ms: f64,
 }
 
 /// Mixture-of-experts feed-forward: route `xb` to the top-k experts by router

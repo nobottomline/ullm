@@ -36,6 +36,24 @@ are kept resident and dequantized in-kernel. Optimization path (decode t/s):
 0.9 (CPU) → 22.7 (one command buffer + GPU top-k) → 32.5 (batched experts) →
 63.6 (word-vectorized 4-bit dequant: 8 nibbles + one scale/bias load per u32).
 
+## Prefill (prompt processing)
+
+The CPU path processes the whole prompt in one batched forward — each weight is
+dequantized once and reused across every prompt position (`matmul_q`) instead of
+once per token. Numerically identical to the token-by-token path (verify with
+`ullm prefill-check <model>`, max |Δlogit| = 0). Measured on a 277-token prompt,
+Apple M4 Max:
+
+| Model | Quant | token-by-token | batched | speedup |
+|-------|-------|---------------:|--------:|--------:|
+| Qwen2.5-1.5B (dense) | Q4_K_M | 38.6 s | 14.7 s | **2.63×** |
+| Qwen3-4B-Instruct (dense) | BF16 | 68.3 s | 41.2 s | 1.66× |
+| Qwen3-Coder-30B-A3B (MoE) | MLX 4-bit | 187.4 s | 119.0 s | 1.58× |
+
+Dense quantized models win most (expensive dequant amortized across the batch).
+The MoE win is smaller because experts are still routed per token; batching the
+expert dispatch and a Metal GEMM prefill are the next steps.
+
 **gemma-3-4b Q6_K is at ~73% of llama.cpp** on the same file. The optimization
 path that got there (decode t/s): 2.7 (CPU) → 5.3 (naive 1-thread-per-row GPU)
 → 28.7 (simdgroup-per-row) → 53.8 (k-quant block split across all 32 lanes) →

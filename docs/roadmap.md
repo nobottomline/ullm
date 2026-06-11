@@ -47,9 +47,12 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 
 These are real today — being explicit so nobody is surprised:
 
-- **Prompt prefill is token-by-token.** A long prompt (RAG, a pasted
-  document) is processed one position at a time, so time-to-first-token grows
-  linearly with prompt length. Batched/parallel prefill is the planned fix.
+- **GPU prefill is still token-by-token.** The CPU path now runs the whole
+  prompt through one batched forward (each weight dequantized once, not once per
+  token — **2.6× faster** prefill on a 277-token Q4_K prompt, numerically
+  identical to the per-token path; validate with `ullm prefill-check <model>`).
+  MoE experts and the Metal prefill path are not batched yet, so a long prompt
+  on the GPU still grows time-to-first-token linearly.
 - **Single request at a time.** The server serializes requests (one mutex
   around the model); no continuous batching yet. Fine for single-Mac local use,
   not for multi-user serving.

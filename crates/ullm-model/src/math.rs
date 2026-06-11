@@ -8,30 +8,58 @@ use crate::{MlxQuant, QWeight};
 /// per-thread reused buffer. Memory-bound work, parallel over output rows.
 pub(crate) fn matvec_q(w: &QWeight, x: &[f32]) -> Vec<f32> {
     let cols = w.cols;
-    if let Some(mlx) = &w.mlx {
-        return (0..w.out)
-            .into_par_iter()
-            .map_init(
-                || vec![0.0f32; cols],
-                |buf, o| {
-                    dequant_mlx_row(&w.data, mlx, o, cols, buf);
-                    buf.iter().zip(x).map(|(a, b)| a * b).sum()
-                },
-            )
-            .collect();
-    }
-    let rb = w.row_bytes();
     (0..w.out)
         .into_par_iter()
         .map_init(
             || vec![0.0f32; cols],
             |buf, o| {
-                ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], buf)
-                    .expect("dequantize weight row");
+                dequant_row(w, o, buf);
                 buf.iter().zip(x).map(|(a, b)| a * b).sum()
             },
         )
         .collect()
+}
+
+/// Dequantize weight row `o` into `buf` (GGUF block quants or MLX 4-bit).
+fn dequant_row(w: &QWeight, o: usize, buf: &mut [f32]) {
+    if let Some(mlx) = &w.mlx {
+        dequant_mlx_row(&w.data, mlx, o, w.cols, buf);
+    } else {
+        let rb = w.row_bytes();
+        ullm_core::dequant::dequantize_into(w.dtype, &w.data[o * rb..o * rb + rb], buf)
+            .expect("dequantize weight row");
+    }
+}
+
+/// Batched matmul: `xs` is `[s_len, cols]` (token-major), returns `[s_len, out]`.
+/// Each weight row is dequantized ONCE and reused across all `s_len` columns —
+/// the win for prompt prefill (vs `s_len` separate `matvec_q` calls, each of
+/// which re-reads and re-dequantizes the whole weight).
+pub(crate) fn matmul_q(w: &QWeight, xs: &[f32], s_len: usize) -> Vec<f32> {
+    let (cols, out) = (w.cols, w.out);
+    let columns: Vec<Vec<f32>> = (0..out)
+        .into_par_iter()
+        .map_init(
+            || vec![0.0f32; cols],
+            |buf, o| {
+                dequant_row(w, o, buf);
+                (0..s_len)
+                    .map(|s| {
+                        let xrow = &xs[s * cols..s * cols + cols];
+                        buf.iter().zip(xrow).map(|(a, b)| a * b).sum::<f32>()
+                    })
+                    .collect()
+            },
+        )
+        .collect();
+    // Transpose [out, s_len] -> token-major [s_len, out].
+    let mut y = vec![0.0f32; s_len * out];
+    for (o, col) in columns.iter().enumerate() {
+        for s in 0..s_len {
+            y[s * out + o] = col[s];
+        }
+    }
+    y
 }
 
 /// Dequantize one row of an MLX 4-bit weight (`[out, cols]`, eight 4-bit values
@@ -159,5 +187,33 @@ mod tests {
             mlx: None,
         };
         assert_eq!(matvec_q(&w, &[3.0, 5.0]), vec![3.0, 5.0]);
+    }
+
+    #[test]
+    fn matmul_q_matches_stacked_matvec() {
+        // A 3x2 weight (out=3, cols=2), F32.
+        let rows: [[f32; 2]; 3] = [[1.0, 2.0], [3.0, 4.0], [-1.0, 0.5]];
+        let data: Vec<u8> = rows
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let w = QWeight {
+            data,
+            dtype: DType::F32,
+            out: 3,
+            cols: 2,
+            mlx: None,
+        };
+        // Three token rows, token-major [s_len, cols].
+        let xs = [1.0f32, 0.0, 0.5, -2.0, 3.0, 3.0];
+        let s_len = 3;
+        let batched = matmul_q(&w, &xs, s_len);
+        // Reference: run each token through matvec_q and concatenate.
+        let mut reference = Vec::new();
+        for s in 0..s_len {
+            reference.extend(matvec_q(&w, &xs[s * 2..s * 2 + 2]));
+        }
+        assert_eq!(batched, reference);
     }
 }

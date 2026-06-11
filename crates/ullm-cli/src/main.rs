@@ -83,6 +83,14 @@ enum Command {
         #[arg(default_value = "The capital of France is")]
         prompt: String,
     },
+    /// Validate batched prefill against the token-by-token CPU forward.
+    PrefillCheck {
+        /// Path to a `.gguf` file or HF model directory.
+        path: PathBuf,
+        /// The prompt to run through both prefill paths.
+        #[arg(default_value = "The capital of France is Paris. The capital of Germany is")]
+        prompt: String,
+    },
 }
 
 fn main() {
@@ -125,7 +133,62 @@ fn main() {
         }
         Command::MetalCheck => metal_check(),
         Command::GpuCheck { path, prompt } => gpu_check(&path, &prompt),
+        Command::PrefillCheck { path, prompt } => prefill_check(&path, &prompt),
     }
+}
+
+/// Run a prompt through the batched prefill and the token-by-token CPU forward
+/// and confirm the final-position logits match (max abs diff + argmax agree).
+fn prefill_check(path: &Path, prompt: &str) {
+    let exit = |e| -> ! {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    };
+    let (tk, mut lm) = if is_safetensors(path) {
+        let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
+        let tk = load_hf_tokenizer(path);
+        // MLX models carry a `quantization` block in config.json.
+        let lm = if st.config().get("quantization").is_some() {
+            LlamaModel::from_mlx(&st).unwrap_or_else(|e| exit(e))
+        } else {
+            LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e))
+        };
+        (tk, lm)
+    } else {
+        let m = GgufModel::open(path).unwrap_or_else(|e| exit(e));
+        let tk = m.tokenizer().unwrap_or_else(|e| exit(e));
+        (tk, LlamaModel::from_gguf(&m).unwrap_or_else(|e| exit(e)))
+    };
+    let ids = tk.encode(prompt, true);
+    let r = lm.prefill_check(&ids);
+
+    println!("prefill-check: {path:?}");
+    println!("  tokens:        {}", ids.len());
+    println!(
+        "  batch argmax:  {}  ({:?})",
+        r.batch_argmax,
+        tk.decode(&[r.batch_argmax])
+    );
+    println!(
+        "  seq   argmax:  {}  ({:?})",
+        r.seq_argmax,
+        tk.decode(&[r.seq_argmax])
+    );
+    println!("  max |Δlogit|:  {:.6}", r.max_diff);
+    println!(
+        "  prefill time:  batched {:.0} ms  ·  token-by-token {:.0} ms  ·  {:.2}x speedup",
+        r.batch_ms,
+        r.seq_ms,
+        r.seq_ms / r.batch_ms.max(1e-9)
+    );
+    println!(
+        "  verdict:       {}",
+        if r.agree && r.max_diff < 1e-2 {
+            "MATCH"
+        } else {
+            "MISMATCH"
+        }
+    );
 }
 
 /// Run a prompt through the CPU and GPU forward passes and compare the logits at
