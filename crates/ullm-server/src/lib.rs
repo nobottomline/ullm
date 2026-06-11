@@ -131,7 +131,11 @@ struct AppState {
 /// Load the model and serve until the process is stopped (blocking).
 pub fn run(model_path: &Path, host: &str, port: u16, gpu: bool) -> Result<()> {
     let engine = Engine::load(model_path, gpu)?;
-    let backend = if engine.model.gpu_enabled() { "gpu" } else { "cpu" };
+    let backend = if engine.model.gpu_enabled() {
+        "gpu"
+    } else {
+        "cpu"
+    };
     let model_id = engine.model_id.clone();
     let chat_format = engine.chat_format;
     let state = AppState {
@@ -402,7 +406,11 @@ impl ChatFormat {
             ChatFormat::Gemma => {
                 for m in messages {
                     // Gemma has no system role; fold it into a user turn.
-                    let r = if m.role == "assistant" { "model" } else { "user" };
+                    let r = if m.role == "assistant" {
+                        "model"
+                    } else {
+                        "user"
+                    };
                     p.push_str(&format!("<start_of_turn>{r}\n{}<end_of_turn>\n", m.content));
                 }
                 p.push_str("<start_of_turn>model\n");

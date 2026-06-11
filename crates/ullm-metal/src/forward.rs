@@ -419,7 +419,14 @@ impl GpuForward {
             }
 
             self.rope(enc, rope_pso, &self.q, 0, p.n_head as u32, pos as u32);
-            self.rope(enc, rope_pso, &self.key_cache, kv_pos_off, p.n_kv_head as u32, pos as u32);
+            self.rope(
+                enc,
+                rope_pso,
+                &self.key_cache,
+                kv_pos_off,
+                p.n_kv_head as u32,
+                pos as u32,
+            );
 
             // attention (Gemma local layers use a sliding window; every 6th is full)
             let attn_start = if p.sliding_window > 0 && l % 6 != 5 && pos + 1 > p.sliding_window {
@@ -442,7 +449,11 @@ impl GpuForward {
 
             // feed-forward: dense SwiGLU/GeGLU, or mixture-of-experts
             self.rmsnorm(enc, &self.x, 0, &lw.ffn_norm, &self.xb, 0, p.n_embd);
-            let ffn_pso = if p.geglu { &self.p_gelu_mul } else { &self.p_silu_mul };
+            let ffn_pso = if p.geglu {
+                &self.p_gelu_mul
+            } else {
+                &self.p_silu_mul
+            };
             if let Some(gate_w) = &lw.moe_gate {
                 // router logits -> top-k -> weighted sum of selected experts in xb2
                 self.matvec(enc, gate_w, &self.xb, &self.moe_logits, 0);
@@ -503,7 +514,11 @@ impl GpuForward {
         let kv_mul = (p.n_head / p.n_kv_head) as u32;
         let seqlen = (pos + 1) as u32;
         let scale = (p.head_dim as f32).sqrt().recip();
-        let rope_pso = if p.rope_neox { &self.p_rope_neox } else { &self.p_rope_norm };
+        let rope_pso = if p.rope_neox {
+            &self.p_rope_neox
+        } else {
+            &self.p_rope_norm
+        };
         let lw = &self.layers[0];
         let kv_pos_off = (pos * kv_dim * 4) as u64;
 
@@ -523,7 +538,11 @@ impl GpuForward {
             }
             let nan = v.iter().filter(|x| x.is_nan()).count();
             let inf = v.iter().filter(|x| x.is_infinite()).count();
-            let mx = v.iter().copied().filter(|x| x.is_finite()).fold(0f32, |a, b| a.max(b.abs()));
+            let mx = v
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .fold(0f32, |a, b| a.max(b.abs()));
             eprintln!("[dbg pos{pos}] {label:<14} nan={nan} inf={inf} maxabs={mx:.4}");
         };
 
@@ -544,10 +563,24 @@ impl GpuForward {
         }
         run(&|e| self.rope(e, rope_pso, &self.q, 0, p.n_head as u32, pos as u32));
         check(&self.q, 0, q_dim, "rope_q");
-        run(&|e| self.rope(e, rope_pso, &self.key_cache, kv_pos_off, p.n_kv_head as u32, pos as u32));
+        run(&|e| {
+            self.rope(
+                e,
+                rope_pso,
+                &self.key_cache,
+                kv_pos_off,
+                p.n_kv_head as u32,
+                pos as u32,
+            )
+        });
         check(&self.key_cache, kv_pos_off, kv_dim, "rope_k");
         run(&|e| self.attn_scores(e, 0, kv_mul, scale, seqlen, 0));
-        check(&self.scores, 0, (p.n_head * seqlen as usize).min(p.n_head * p.n_ctx), "attn_scores");
+        check(
+            &self.scores,
+            0,
+            (p.n_head * seqlen as usize).min(p.n_head * p.n_ctx),
+            "attn_scores",
+        );
         run(&|e| self.attn_softmax(e, seqlen, 0));
         run(&|e| self.attn_output(e, 0, kv_mul, seqlen, 0));
         check(&self.attn, 0, q_dim, "attn_out");
@@ -563,7 +596,11 @@ impl GpuForward {
         check(&self.gate, 0, p.n_ff, "gate");
         run(&|e| self.matvec(e, &lw.w_up, &self.xb, &self.up, 0));
         check(&self.up, 0, p.n_ff, "up");
-        let ffn_pso = if p.geglu { &self.p_gelu_mul } else { &self.p_silu_mul };
+        let ffn_pso = if p.geglu {
+            &self.p_gelu_mul
+        } else {
+            &self.p_silu_mul
+        };
         run(&|e| self.glu(e, ffn_pso, p.n_ff));
         check(&self.hidden, 0, p.n_ff, "glu");
         run(&|e| self.matvec(e, &lw.w_down, &self.hidden, &self.xb2, 0));
@@ -816,7 +853,14 @@ impl GpuForward {
         self.add_off(enc, x, 0, y, n);
     }
 
-    fn add_off(&self, enc: &ComputeCommandEncoderRef, x: &Buffer, x_off: u64, y: &Buffer, n: usize) {
+    fn add_off(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        x_off: u64,
+        y: &Buffer,
+        n: usize,
+    ) {
         enc.set_compute_pipeline_state(&self.p_add);
         enc.set_buffer(0, Some(x), x_off);
         enc.set_buffer(1, Some(y), 0);

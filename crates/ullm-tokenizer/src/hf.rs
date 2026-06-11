@@ -159,8 +159,14 @@ mod tests {
         vocab.insert(he.clone(), serde_json::json!(256));
         vocab.insert(gw.clone(), serde_json::json!(257));
         let merges = serde_json::json!([
-            [b2u[b'h' as usize].to_string(), b2u[b'e' as usize].to_string()],
-            [b2u[b' ' as usize].to_string(), b2u[b'w' as usize].to_string()],
+            [
+                b2u[b'h' as usize].to_string(),
+                b2u[b'e' as usize].to_string()
+            ],
+            [
+                b2u[b' ' as usize].to_string(),
+                b2u[b'w' as usize].to_string()
+            ],
         ]);
         let doc = serde_json::json!({
             "added_tokens": [{"id": 258, "content": "<|end|>", "special": true}],

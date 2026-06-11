@@ -244,9 +244,7 @@ impl LlamaModel {
         let n_layer = req("num_hidden_layers")?;
         let n_kv_head = model.config_usize("num_key_value_heads").unwrap_or(n_head);
         let n_ff = req("intermediate_size")?;
-        let head_dim = model
-            .config_usize("head_dim")
-            .unwrap_or(n_embd / n_head);
+        let head_dim = model.config_usize("head_dim").unwrap_or(n_embd / n_head);
         let n_ctx = model
             .config_usize("max_position_embeddings")
             .unwrap_or(8192)
@@ -385,7 +383,10 @@ impl LlamaModel {
     fn build_gpu(&self) -> Result<GpuForward> {
         let c = &self.config;
         let qk_norm = self.layers.first().is_some_and(|l| l.q_norm.is_some());
-        let sandwich_norm = self.layers.first().is_some_and(|l| l.post_attn_norm.is_some());
+        let sandwich_norm = self
+            .layers
+            .first()
+            .is_some_and(|l| l.post_attn_norm.is_some());
         let params = GpuParams {
             n_embd: c.n_embd,
             n_layer: c.n_layer,
@@ -763,7 +764,10 @@ fn moe_ffn(lw: &LayerWeights, gate_w: &QWeight, xb: &[f32], n_used: usize) -> Ve
     idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
     idx.truncate(n_used);
     // Softmax over the selected logits (== softmax over all then renormalize).
-    let max = idx.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
+    let max = idx
+        .iter()
+        .map(|&i| logits[i])
+        .fold(f32::NEG_INFINITY, f32::max);
     let mut wsum = 0.0f32;
     let mut weights: Vec<f32> = idx
         .iter()

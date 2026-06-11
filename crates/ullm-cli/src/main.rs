@@ -138,7 +138,10 @@ fn gpu_check(path: &Path, prompt: &str) {
     let load = |gpu: bool| -> (ullm_tokenizer::Tokenizer, LlamaModel) {
         let (tk, mut lm) = if is_safetensors(path) {
             let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
-            (load_hf_tokenizer(path), LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e)))
+            (
+                load_hf_tokenizer(path),
+                LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e)),
+            )
         } else {
             let m = GgufModel::open(path).unwrap_or_else(|e| exit(e));
             let tk = m.tokenizer().unwrap_or_else(|e| exit(e));
@@ -165,22 +168,40 @@ fn gpu_check(path: &Path, prompt: &str) {
         gpu_logits = gpu.forward(t, pos);
     }
 
-    let argmax = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) }).0;
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold(
+                (0usize, f32::MIN),
+                |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) },
+            )
+            .0
+    };
     let (ca, ga) = (argmax(&cpu_logits), argmax(&gpu_logits));
-    let max_abs = cpu_logits.iter().zip(&gpu_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_abs = cpu_logits
+        .iter()
+        .zip(&gpu_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     let scale = cpu_logits.iter().map(|c| c.abs()).fold(1e-6f32, f32::max);
 
     println!("gpu-check: {path:?}");
     println!("  tokens:        {}", ids.len());
     println!("  cpu argmax:    {ca} (logit {:.3})", cpu_logits[ca]);
     println!("  gpu argmax:    {ga} (logit {:.3})", gpu_logits[ga]);
-    println!("  max |Δlogit|:  {max_abs:.4}  (rel {:.2e})", max_abs / scale);
+    println!(
+        "  max |Δlogit|:  {max_abs:.4}  (rel {:.2e})",
+        max_abs / scale
+    );
     println!(
         "  decoded next:  cpu={:?}  gpu={:?}",
         tk.decode(&[ca as u32]),
         tk.decode(&[ga as u32])
     );
-    println!("  verdict:       {}", if ca == ga { "ARGMAX MATCH" } else { "MISMATCH" });
+    println!(
+        "  verdict:       {}",
+        if ca == ga { "ARGMAX MATCH" } else { "MISMATCH" }
+    );
 }
 
 fn doctor() {

@@ -82,8 +82,10 @@ impl SafeTensorsModel {
                 .get("weight_map")
                 .and_then(Value::as_object)
                 .ok_or_else(|| Error::Format("index.json: missing weight_map".into()))?;
-            let mut files: Vec<String> =
-                map.values().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+            let mut files: Vec<String> = map
+                .values()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
             files.sort();
             files.dedup();
             for file in files {
@@ -129,9 +131,11 @@ impl SafeTensorsModel {
             if name == "__metadata__" {
                 continue;
             }
-            let dtype = parse_dtype(info.get("dtype").and_then(Value::as_str).ok_or_else(
-                || Error::Format(format!("tensor '{name}': missing dtype")),
-            )?)?;
+            let dtype = parse_dtype(
+                info.get("dtype")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::Format(format!("tensor '{name}': missing dtype")))?,
+            )?;
             let shape: Vec<usize> = info
                 .get("shape")
                 .and_then(Value::as_array)
@@ -169,12 +173,18 @@ impl SafeTensorsModel {
 
     /// Read a `usize` field from `config.json`.
     pub fn config_usize(&self, key: &str) -> Option<usize> {
-        self.config.get(key).and_then(Value::as_u64).map(|v| v as usize)
+        self.config
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
     }
 
     /// Read an `f32` field from `config.json`.
     pub fn config_f32(&self, key: &str) -> Option<f32> {
-        self.config.get(key).and_then(Value::as_f64).map(|v| v as f32)
+        self.config
+            .get(key)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
     }
 
     /// Read a string field from `config.json`.
