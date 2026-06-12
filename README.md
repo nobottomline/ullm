@@ -4,122 +4,66 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](rust-toolchain.toml)
 
-**The local inference engine for agents — where the model has to obey.**
+**The local inference engine where the model obeys.** Bring any model you
+already have — GGUF, Hugging Face, or Apple MLX — and get output *guaranteed* to
+match a JSON Schema, a grammar, or a regex: valid JSON every time, tool calls
+that are always well-formed, no retries, no JSON-repair. Pure Rust,
+Apple-Silicon-first, embeddable.
 
-Bring any model you already have — GGUF, Hugging Face, or Apple MLX — and get
-output that is *guaranteed* to match a schema, a grammar, or a regex. Valid JSON
-every time, a tool call that is always well-formed, an answer from a fixed set —
-with no retries and no JSON-repair. Pure Rust, Apple-Silicon-first, embeddable.
-
-> **Status: single-Mac, structured output complete.** Runs real models
-> end-to-end on the Metal GPU — GGUF, SafeTensors (Hugging Face), and Apple MLX,
-> including a 30B mixture-of-experts — with guaranteed grammar / JSON-Schema /
-> regex-constrained decoding on every format. See
-> [why uLLM exists](docs/strategy/positioning.md) and the
-> [roadmap](docs/roadmap.md).
-
----
-
-## What it does today
-
-- **Guaranteed structured output** — a GBNF grammar, a JSON Schema, or a regex
-  constrains decoding at the logit level, so tokens that would break the contract
-  are impossible to sample. `--json` always yields parseable JSON; `--schema`
-  (incl. `$ref` / recursion, `enum`, `pattern`/`format`) yields schema-conforming
-  JSON; `--regex` matches a pattern; `--grammar` runs an arbitrary GBNF grammar.
-  Works on **every format** (GGUF / HF / MLX) and on **CPU and GPU**, with the
-  per-token cost cached down to ~tens of µs.
-- **OpenAI-compatible Structured Outputs & tool calling** — the server honors
-  `response_format` (`json_object` / `json_schema`), `tools` + `tool_choice`
-  (returning `tool_calls` whose arguments are *guaranteed* to match the function
-  schema), and a raw `grammar` extension. A drop-in local OpenAI for agents.
-- **Loads three formats through one runtime** — GGUF (llama.cpp), SafeTensors
-  (Hugging Face), and Apple MLX (4-bit) — via a container-agnostic `WeightSource`.
-- **Architectures:** Llama 2/3, Qwen2, Qwen3, **Qwen3-MoE**, Gemma-3.
-- **Full GPU forward on Metal** — weights, activations and KV cache stay
-  resident; the whole token is one command buffer (matvec, RMSNorm, RoPE,
-  attention, SwiGLU/GeGLU, MoE router + experts), with dequant-in-kernel for
-  Q4_K / Q6_K / MLX-4bit / BF16 / F16.
-- **OpenAI-compatible server** — `/v1/chat/completions` (streaming + not), with
-  per-model chat templates (ChatML / Gemma / Llama-3) detected automatically.
-- **Quantization:** F16/BF16, Q8_0, Q4_0/1, Q5_0/1, Q4_K/Q5_K/Q6_K, MLX 4-bit.
-
-Every GPU forward is validated against the CPU reference (`ullm gpu-check`), and
-the MLX path is validated token-for-token against `mlx_lm`.
-
-## Benchmarks
-
-Single-stream decode on an Apple M4 Max (full numbers + how to reproduce in
-[`docs/benchmarks.md`](docs/benchmarks.md)):
-
-| Model | Format | uLLM GPU |
-|-------|--------|---------:|
-| Llama-3.2-1B | GGUF Q4_K_M | 263 tok/s |
-| Qwen2.5-1.5B | GGUF Q4_K_M | 190 tok/s |
-| gemma-3-4b | GGUF Q6_K | 80.5 tok/s |
-| Qwen3-4B | HF BF16 | 26.6 tok/s |
-| Qwen3-Coder-30B-A3B | MLX 4-bit (MoE) | 63.6 tok/s |
+> **Status:** single-Mac, structured output complete. Runs real models on the
+> Metal GPU — including a 30B mixture-of-experts — and the guarantee holds on
+> every format, on CPU and GPU. See the [roadmap](docs/roadmap.md).
 
 ## Quickstart
 
 ```sh
-cargo build --release
+cargo build --release   # binary at ./target/release/ullm
 
-# Run a model (GGUF file, or a Hugging Face / MLX directory). Drop --gpu for CPU.
-./target/release/ullm run model.gguf "The capital of France is" --gpu
-./target/release/ullm run ./Qwen3-Coder-30B-A3B-MLX-4bit "Write a quicksort." --gpu
+# Generate from a GGUF file, or a Hugging Face / MLX directory. Drop --gpu for CPU.
+ullm run model.gguf "The capital of France is" --gpu
 
-# Guaranteed structured output — the response is always valid JSON...
-./target/release/ullm run model.gguf "Extract name and age: John is 30." --json --gpu
-# ...conforming to a JSON Schema (right keys, types, enums — provably valid)...
-./target/release/ullm run model.gguf "Review: great blender, 5 stars." --schema grammars/review.schema.json --gpu
-# ...matching a regular expression (a date, an ID, a phone number)...
-./target/release/ullm run model.gguf "The date two days after 2024-01-13 is" --regex '[0-9]{4}-[0-9]{2}-[0-9]{2}'
-# ...or constrained to your own grammar (e.g. a fixed label set).
-echo 'root ::= "positive" | "negative" | "neutral"' > sentiment.gbnf
-./target/release/ullm run model.gguf "Sentiment of 'I loved it'. Answer:" --grammar sentiment.gbnf
+# Structured output that cannot come out malformed:
+ullm run model.gguf "Extract: John is 30."          --json
+ullm run model.gguf "Review: great blender, 5 stars" --schema grammars/review.schema.json
+ullm run model.gguf "Date two days after 2024-01-13:" --regex '[0-9]{4}-[0-9]{2}-[0-9]{2}'
 
-# OpenAI-compatible server — with Structured Outputs (a drop-in local OpenAI)
-./target/release/ullm serve model.gguf --gpu          # http://127.0.0.1:8080
+# OpenAI-compatible server with Structured Outputs + tool calling:
+ullm serve model.gguf --gpu     # http://127.0.0.1:8080
 curl localhost:8080/v1/chat/completions -d '{
   "messages": [{"role":"user","content":"Extract: Acme blender, 5 stars."}],
-  "response_format": {"type":"json_schema","json_schema":{"schema":{
-    "type":"object",
-    "properties":{"product":{"type":"string"},"rating":{"type":"integer"}},
-    "required":["product","rating"]}}}
-}'   # -> assistant content is guaranteed to match the schema
-
-# Inspect a model, tokenize text, validate the GPU vs CPU forward
-./target/release/ullm inspect model.gguf
-./target/release/ullm gpu-check model.gguf
-./target/release/ullm doctor
+  "response_format": {"type":"json_schema","json_schema":{"schema":
+    {"type":"object","properties":{"product":{"type":"string"},"rating":{"type":"integer"}},
+     "required":["product","rating"]}}}}'   # content is guaranteed to match the schema
 ```
 
-## Why uLLM
+`ullm --help` also has `inspect`, `tokenize`, `doctor`, and `gpu-check`.
 
-"One engine that's great on a laptop *and* scales to serving" is everyone's
-pitch — and a losing one for a young project. We won't out-breadth llama.cpp or
-out-throughput vLLM, and "the same thing but in Rust" is no reason to switch.
+## What it does
 
-So we pick a corner the incumbents do clunkily or not at all and own it:
-**making a local model obey a contract.** Agents and apps don't want prose; they
-want a tool call that is well-formed *every time* and a JSON object that *always*
-parses. uLLM constrains decoding so invalid output is impossible — on any model
-format you already have, from one small embeddable Rust binary. MLX-quantized
-models run with no Python.
+- **Guaranteed structure** — GBNF grammar / JSON Schema (`$ref`, recursion,
+  `enum`, `pattern`/`format`) / regex, enforced at the logit level so a token
+  that would break the contract is impossible to sample. The per-token cost is
+  cached down to ~tens of µs.
+- **OpenAI-compatible** — `/v1/chat/completions` (streaming), `response_format`,
+  and `tools` + `tool_choice` returning valid `tool_calls`. A drop-in local
+  OpenAI for agents.
+- **Any weights, one runtime** — GGUF, SafeTensors, and Apple MLX (4-bit) load
+  with no conversion; Llama 2/3, Qwen2/3, Qwen3-MoE, Gemma-3.
+- **Full Metal GPU forward** — weights, activations and KV cache stay resident,
+  one command buffer per token, dequant-in-kernel; validated against the CPU
+  reference (`ullm gpu-check`) and, for MLX, token-for-token against `mlx_lm`.
 
-The full argument — who it's for and what we explicitly are not — is in
-[`docs/strategy/positioning.md`](docs/strategy/positioning.md).
+## Benchmarks
 
-## Principles
+Single-stream decode, Apple M4 Max ([numbers + how to reproduce](docs/benchmarks.md)):
 
-- **The model obeys** — structured output is guaranteed at the logit level, not
-  prompted-for and hoped-for.
-- **Bring your own weights** — GGUF, SafeTensors, and MLX load into one runtime;
-  the same grammar works on all of them.
-- **Embeddable** — pure Rust, one binary, no Python or C toolchain; Metal now,
-  Vulkan/CUDA next.
-- **Honest** — reproducible benchmarks, validated against reference engines.
+| Model | Format | tok/s |
+|-------|--------|------:|
+| Llama-3.2-1B | GGUF Q4_K_M | 263 |
+| Qwen2.5-1.5B | GGUF Q4_K_M | 190 |
+| gemma-3-4b | GGUF Q6_K | 80.5 |
+| Qwen3-4B | HF BF16 | 26.6 |
+| Qwen3-Coder-30B-A3B | MLX 4-bit (MoE) | 63.6 |
 
 ## Layout
 
@@ -129,14 +73,17 @@ crates/
   ullm-gguf/         GGUF loader
   ullm-safetensors/  SafeTensors / Hugging Face + MLX loader
   ullm-tokenizer/    SentencePiece + byte-level BPE + tokenizer.json
-  ullm-grammar/      GBNF grammar engine (guaranteed structured output)
+  ullm-grammar/      grammar / JSON-Schema / regex constraint engine
   ullm-model/        CPU runtime, architectures, sampling, MLX/MoE
   ullm-metal/        Metal GPU backend (full forward + kernels)
   ullm-server/       OpenAI-compatible HTTP server
   ullm-cli/          the `ullm` binary
-grammars/            ready-to-use GBNF grammars (json, sentiment, ...)
-docs/                roadmap, architecture, benchmarks, strategy, decisions
 ```
+
+## Docs
+
+- [Why uLLM exists](docs/strategy/positioning.md) — the corner we own, and what we're explicitly not
+- [Architecture](docs/architecture/00-overview.md) · [Roadmap](docs/roadmap.md) · [Benchmarks](docs/benchmarks.md) · [Decisions (ADRs)](docs/adr)
 
 ## License
 
