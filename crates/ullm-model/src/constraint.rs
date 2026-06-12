@@ -5,7 +5,7 @@
 //! they can never be chosen. The output is structurally valid by construction —
 //! no retries, no JSON-repair.
 
-use ullm_grammar::{Grammar, GrammarState};
+use ullm_grammar::{Grammar, GrammarState, TokenTrie};
 
 /// A constraint applied to the logits in place before sampling.
 pub trait LogitConstraint {
@@ -16,32 +16,31 @@ pub trait LogitConstraint {
 }
 
 /// A [`LogitConstraint`] driven by a GBNF [`Grammar`]: it holds the live matcher,
-/// the per-token byte pieces, and the EOS id (which is allowed only when the
-/// grammar may legally terminate).
-pub struct GrammarConstraint<'g> {
-    state: GrammarState<'g>,
-    pieces: Vec<Vec<u8>>,
+/// a prebuilt [`TokenTrie`] over the vocabulary (for fast masking), and the EOS
+/// id (allowed only when the grammar may legally terminate).
+pub struct GrammarConstraint<'a> {
+    state: GrammarState<'a>,
+    trie: &'a TokenTrie,
     eos: Option<u32>,
     allowed: Vec<bool>,
 }
 
-impl<'g> GrammarConstraint<'g> {
-    /// `pieces[id]` is the raw bytes token `id` contributes (from
-    /// `Tokenizer::token_pieces`); `eos` is the end-of-sequence id, if any.
-    pub fn new(grammar: &'g Grammar, pieces: Vec<Vec<u8>>, eos: Option<u32>) -> Self {
-        let n = pieces.len();
+impl<'a> GrammarConstraint<'a> {
+    /// `trie` is built once from `Tokenizer::token_pieces()` and reused across
+    /// requests; `eos` is the end-of-sequence id, if any.
+    pub fn new(grammar: &'a Grammar, trie: &'a TokenTrie, eos: Option<u32>) -> Self {
         Self {
             state: GrammarState::new(grammar),
-            pieces,
+            trie,
             eos,
-            allowed: vec![false; n],
+            allowed: vec![false; trie.vocab_size()],
         }
     }
 }
 
 impl LogitConstraint for GrammarConstraint<'_> {
     fn constrain(&mut self, logits: &mut [f32]) {
-        self.state.allowed_mask(&self.pieces, &mut self.allowed);
+        self.state.allowed_mask_trie(self.trie, &mut self.allowed);
         let can_end = self.state.can_end();
         for (i, l) in logits.iter_mut().enumerate() {
             let ok = self.allowed.get(i).copied().unwrap_or(false)
@@ -60,10 +59,9 @@ impl LogitConstraint for GrammarConstraint<'_> {
     }
 
     fn accept(&mut self, token: u32) {
-        if let Some(piece) = self.pieces.get(token as usize) {
-            if !piece.is_empty() {
-                self.state.accept_token(piece);
-            }
+        let piece = self.trie.piece(token);
+        if !piece.is_empty() {
+            self.state.accept_token(piece);
         }
     }
 }

@@ -21,7 +21,7 @@ pub use config::{Arch, LlamaConfig};
 pub use constraint::{GrammarConstraint, LogitConstraint};
 pub use sample::SampleParams;
 // Re-export the grammar types so callers build constraints without a direct dep.
-pub use ullm_grammar::Grammar;
+pub use ullm_grammar::{Grammar, GrammarState, TokenTrie};
 
 use math::{
     add_bias, dequant_mlx_row, gelu, matmul_q, matvec_q, rmsnorm, rope, rope_neox, silu, softmax,

@@ -8,7 +8,7 @@ use ullm_core::device::Hardware;
 use ullm_core::ir::WeightSource;
 use ullm_gguf::GgufModel;
 use ullm_metal::MetalContext;
-use ullm_model::{Grammar, GrammarConstraint, LlamaModel, SampleParams};
+use ullm_model::{Grammar, GrammarConstraint, GrammarState, LlamaModel, SampleParams, TokenTrie};
 use ullm_safetensors::SafeTensorsModel;
 
 #[derive(Parser)]
@@ -100,6 +100,11 @@ enum Command {
         #[arg(default_value = "The capital of France is Paris. The capital of Germany is")]
         prompt: String,
     },
+    /// Benchmark grammar masking (naive O(vocab) vs the token-trie fast path).
+    GrammarBench {
+        /// Path to a `.gguf` file or HF model directory (for its tokenizer).
+        path: PathBuf,
+    },
 }
 
 fn main() {
@@ -149,6 +154,58 @@ fn main() {
         Command::MetalCheck => metal_check(),
         Command::GpuCheck { path, prompt } => gpu_check(&path, &prompt),
         Command::PrefillCheck { path, prompt } => prefill_check(&path, &prompt),
+        Command::GrammarBench { path } => grammar_bench(&path),
+    }
+}
+
+/// Time grammar masking with the naive O(vocab) path vs the token-trie path, at
+/// a permissive state (inside a JSON string, where most tokens are valid).
+fn grammar_bench(path: &Path) {
+    let tk = if is_safetensors(path) {
+        load_hf_tokenizer(path)
+    } else {
+        let model = GgufModel::open(path).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+        model.tokenizer().unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        })
+    };
+    let pieces = tk.token_pieces();
+    let trie = TokenTrie::new(pieces.clone());
+    let grammar = Grammar::json();
+    println!("grammar-bench: {path:?}  (vocab {})", pieces.len());
+
+    let iters = 200u32;
+    for (label, steps) in [
+        ("root", Vec::new()),
+        ("inside a JSON string", vec![b"\"".to_vec()]),
+    ] {
+        let mut st = GrammarState::new(&grammar);
+        for s in &steps {
+            st.accept_token(s);
+        }
+        let mut mask = vec![false; pieces.len()];
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            st.allowed_mask(&pieces, &mut mask);
+        }
+        let naive_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            st.allowed_mask_trie(&trie, &mut mask);
+        }
+        let trie_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let allowed = mask.iter().filter(|b| **b).count();
+        println!(
+            "  [{label}] {allowed} tokens allowed  ·  naive {naive_us:.0} µs  ·  trie {trie_us:.1} µs  ·  {:.1}x faster",
+            naive_us / trie_us.max(1e-9)
+        );
     }
 }
 
@@ -545,9 +602,12 @@ fn run(
         (None, None, true) => Some(Grammar::json()),
         (None, None, false) => None,
     };
-    let mut constraint = grammar
-        .as_ref()
-        .map(|g| GrammarConstraint::new(g, tk.token_pieces(), tk.eos_id()));
+    // Build the vocabulary trie once (used by the constraint's fast masking).
+    let trie = grammar.as_ref().map(|_| TokenTrie::new(tk.token_pieces()));
+    let mut constraint = match (grammar.as_ref(), trie.as_ref()) {
+        (Some(g), Some(t)) => Some(GrammarConstraint::new(g, t, tk.eos_id())),
+        _ => None,
+    };
 
     // Prefill (process the prompt) timed separately from decode.
     let t_gen = std::time::Instant::now();

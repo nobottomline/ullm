@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use ullm_core::{Error, Result};
 use ullm_gguf::GgufModel;
-use ullm_model::{Grammar, GrammarConstraint, LlamaModel, SampleParams};
+use ullm_model::{Grammar, GrammarConstraint, LlamaModel, SampleParams, TokenTrie};
 use ullm_safetensors::SafeTensorsModel;
 use ullm_tokenizer::Tokenizer;
 
@@ -30,6 +30,8 @@ use ullm_tokenizer::Tokenizer;
 struct Engine {
     model: LlamaModel,
     tokenizer: Tokenizer,
+    /// Vocabulary trie, built once at load, reused for fast grammar masking.
+    trie: TokenTrie,
     model_id: String,
     chat_format: ChatFormat,
 }
@@ -70,18 +72,13 @@ impl Engine {
             .and_then(|s| s.to_str())
             .unwrap_or("model")
             .to_string();
+        let trie = TokenTrie::new(tokenizer.token_pieces());
         Ok(Self {
             model,
             tokenizer,
+            trie,
             model_id,
             chat_format,
-        })
-    }
-
-    /// A grammar constraint bound to this engine's vocabulary, if `grammar` is set.
-    fn constraint<'g>(&self, grammar: Option<&'g Grammar>) -> Option<GrammarConstraint<'g>> {
-        grammar.map(|g| {
-            GrammarConstraint::new(g, self.tokenizer.token_pieces(), self.tokenizer.eos_id())
         })
     }
 
@@ -94,11 +91,13 @@ impl Engine {
         grammar: Option<&Grammar>,
     ) -> (String, usize, usize) {
         let prompt_ids = self.tokenizer.encode(prompt, true);
-        let mut constraint = self.constraint(grammar);
+        let eos = self.tokenizer.eos_id();
+        // Direct field borrows (self.trie / self.model) keep these disjoint.
+        let mut constraint = grammar.map(|g| GrammarConstraint::new(g, &self.trie, eos));
         let generated = self.model.generate(
             &prompt_ids,
             max_tokens,
-            self.tokenizer.eos_id(),
+            eos,
             params,
             constraint
                 .as_mut()
@@ -121,7 +120,7 @@ impl Engine {
         let eos = self.tokenizer.eos_id();
         let mut all = prompt_ids.clone();
         let mut sent = self.tokenizer.decode(&prompt_ids).len();
-        let mut constraint = self.constraint(grammar);
+        let mut constraint = grammar.map(|g| GrammarConstraint::new(g, &self.trie, eos));
         let cons = constraint
             .as_mut()
             .map(|c| c as &mut dyn ullm_model::LogitConstraint);

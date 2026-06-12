@@ -16,7 +16,9 @@
 
 mod parser;
 mod schema;
+mod trie;
 
+pub use trie::TokenTrie;
 use ullm_core::Result;
 
 /// A set of byte ranges, optionally negated — one character class `[...]`.
@@ -59,7 +61,7 @@ pub struct Grammar {
 }
 
 /// A position inside the grammar: element `elem` of alternative `alt` of `rule`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct Pos {
     rule: u32,
     alt: u32,
@@ -190,6 +192,62 @@ fn dedup(stacks: &mut Vec<Stack>) {
     stacks.dedup();
 }
 
+/// One token-trie walk, paired with the grammar, computing the allowed-token
+/// mask. Distinct stack-sets are interned to ids and `(state, byte)` transitions
+/// are memoized, so a permissive loop (e.g. inside a string, where one state
+/// recurs across the whole subtree) computes each transition once instead of
+/// once per trie edge.
+struct Walk<'a> {
+    g: &'a Grammar,
+    states: Vec<Vec<Stack>>,
+    ids: std::collections::HashMap<Vec<Stack>, u32>,
+    edge: std::collections::HashMap<(u32, u8), u32>,
+}
+
+/// Sentinel transition target meaning "the byte is rejected here".
+const DEAD: u32 = u32::MAX;
+
+impl Walk<'_> {
+    fn intern(&mut self, s: Vec<Stack>) -> u32 {
+        if let Some(&id) = self.ids.get(&s) {
+            return id;
+        }
+        let id = self.states.len() as u32;
+        self.states.push(s.clone());
+        self.ids.insert(s, id);
+        id
+    }
+
+    /// The state after consuming byte `b` in state `id`, or `None` if rejected.
+    fn step(&mut self, id: u32, b: u8) -> Option<u32> {
+        if let Some(&n) = self.edge.get(&(id, b)) {
+            return (n != DEAD).then_some(n);
+        }
+        let next = self.g.accept_byte(&self.states[id as usize], b);
+        let r = if next.is_empty() {
+            DEAD
+        } else {
+            self.intern(next)
+        };
+        self.edge.insert((id, b), r);
+        (r != DEAD).then_some(r)
+    }
+
+    // `trie` is a separate parameter (not a field) so iterating a node's children
+    // doesn't borrow `self`, leaving `self` free for the memoized `step`.
+    fn descend(&mut self, trie: &TokenTrie, node: usize, id: u32, allowed: &mut [bool]) {
+        let n = trie.node(node);
+        for &tid in &n.tokens {
+            allowed[tid as usize] = true;
+        }
+        for &(byte, child) in &n.children {
+            if let Some(nid) = self.step(id, byte) {
+                self.descend(trie, child as usize, nid, allowed);
+            }
+        }
+    }
+}
+
 /// The live matcher for one generation: the current automaton state plus the
 /// methods a sampler needs (which tokens are allowed, may we stop, advance).
 pub struct GrammarState<'g> {
@@ -250,7 +308,9 @@ impl<'g> GrammarState<'g> {
     }
 
     /// Fill `allowed[id] = true` for every token whose bytes keep the output on
-    /// a grammar-valid path. `allowed` must be sized to the vocabulary.
+    /// a grammar-valid path. `allowed` must be sized to the vocabulary. O(vocab)
+    /// per call — see [`allowed_mask_trie`](Self::allowed_mask_trie) for the fast
+    /// path used in generation.
     pub fn allowed_mask(&self, pieces: &[Vec<u8>], allowed: &mut [bool]) {
         let fb = self.first_bytes();
         for (id, piece) in pieces.iter().enumerate() {
@@ -259,6 +319,23 @@ impl<'g> GrammarState<'g> {
                 _ => false,
             };
         }
+    }
+
+    /// Like [`allowed_mask`](Self::allowed_mask) but driven by a prebuilt
+    /// [`TokenTrie`]: one walk shares prefix work across the whole vocabulary and
+    /// prunes grammar-dead subtrees, so the cost tracks the number of *valid*
+    /// prefixes rather than the vocabulary size.
+    pub fn allowed_mask_trie(&self, trie: &TokenTrie, allowed: &mut [bool]) {
+        for a in allowed.iter_mut() {
+            *a = false;
+        }
+        let mut w = Walk {
+            g: self.grammar,
+            states: vec![self.stacks.clone()],
+            ids: std::collections::HashMap::from([(self.stacks.clone(), 0u32)]),
+            edge: std::collections::HashMap::new(),
+        };
+        w.descend(trie, 0, 0, allowed);
     }
 
     /// Advance the state by a chosen token's bytes. Returns `false` (and leaves
@@ -295,6 +372,32 @@ mod tests {
 
     fn pieces_for(s: &[&str]) -> Vec<Vec<u8>> {
         s.iter().map(|t| t.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn trie_mask_equals_naive_mask() {
+        // A vocabulary with shared prefixes and special (empty-piece) tokens.
+        let pieces = pieces_for(&[
+            "{", "}", "\"", "\"a", "\"ab", "true", "tru", "1", "12", ":", ",", " ",
+        ]);
+        let trie = TokenTrie::new(pieces.clone());
+        let g = Grammar::json();
+        // Drive a few steps and check the two mask paths agree at each one.
+        for prefix in [
+            vec![],
+            vec![b"{".to_vec()],
+            vec![b"{".to_vec(), b"\"a".to_vec()],
+        ] {
+            let mut st = GrammarState::new(&g);
+            for p in &prefix {
+                st.accept_token(p);
+            }
+            let mut naive = vec![false; pieces.len()];
+            let mut fast = vec![false; pieces.len()];
+            st.allowed_mask(&pieces, &mut naive);
+            st.allowed_mask_trie(&trie, &mut fast);
+            assert_eq!(naive, fast, "trie mask must match naive mask");
+        }
     }
 
     /// Walk a grammar over a byte string one token-piece at a time, asserting

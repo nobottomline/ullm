@@ -36,6 +36,24 @@ are kept resident and dequantized in-kernel. Optimization path (decode t/s):
 0.9 (CPU) → 22.7 (one command buffer + GPU top-k) → 32.5 (batched experts) →
 63.6 (word-vectorized 4-bit dequant: 8 nibbles + one scale/bias load per u32).
 
+## Grammar masking (structured output)
+
+Constrained decoding adds a per-token step: mask every token the grammar can't
+accept. The naive mask simulates each token separately (O(vocab)); the token
+trie walks the vocabulary once, interning grammar states and memoizing
+`(state, byte)` transitions. Measured with `ullm grammar-bench`, Qwen3-4B
+tokenizer (vocab 151 669), JSON grammar, Apple M4 Max:
+
+| Grammar state | tokens allowed | naive | token trie | speedup |
+|---------------|---------------:|------:|-----------:|--------:|
+| structural (at `root`) | 1 062 | ~95 ms | **~0.18 ms** | ~550× |
+| inside an open string | 150 331 | ~260 ms | **~7 ms** | ~35× |
+
+Structural states (the bulk of a typical JSON/tool-call generation) cost well
+under a millisecond; the worst case — an unconstrained string interior where
+almost every token is legal — is the floor, bounded by having to mark each
+allowed token.
+
 ## Prefill (prompt processing)
 
 The CPU path processes the whole prompt in one batched forward — each weight is
