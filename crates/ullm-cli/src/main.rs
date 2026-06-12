@@ -427,6 +427,20 @@ fn is_safetensors(path: &Path) -> bool {
     path.is_dir() || path.extension().is_some_and(|e| e == "safetensors")
 }
 
+/// If `path` points at a `.safetensors` file inside an HF model directory (one
+/// with a `config.json`), use the directory instead — so pointing at the model
+/// folder *or* one of its weight files both work.
+fn resolve_model_path(path: &Path) -> PathBuf {
+    if path.extension().is_some_and(|e| e == "safetensors") {
+        if let Some(dir) = path.parent() {
+            if dir.join("config.json").exists() {
+                return dir.to_path_buf();
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 fn inspect(path: &Path) {
     if is_safetensors(path) {
         inspect_safetensors(path);
@@ -561,19 +575,14 @@ fn inspect_safetensors(path: &Path) {
 /// Load a tokenizer from a HF directory / `.safetensors` model via its
 /// `tokenizer.json`, reading `bos`/`eos` ids from `config.json`.
 fn load_hf_tokenizer(path: &Path) -> ullm_tokenizer::Tokenizer {
-    let model = match SafeTensorsModel::open(path) {
+    let path = resolve_model_path(path);
+    let model = match SafeTensorsModel::open(&path) {
         Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => die(e),
     };
     let tj = match model.tokenizer_json_path() {
         Some(p) => p,
-        None => {
-            eprintln!("error: no tokenizer.json next to the model");
-            std::process::exit(1);
-        }
+        None => die("no tokenizer.json found — point at the model directory, not a single file"),
     };
     let bytes = std::fs::read(&tj).unwrap_or_else(|e| {
         eprintln!("error: {e}");
@@ -625,6 +634,8 @@ fn die(e: impl std::fmt::Display) -> ! {
 /// an HF/MLX directory, optionally moving the forward pass onto the Metal GPU.
 /// The single loading path shared by `run`, `gpu-check` and `prefill-check`.
 fn load_model(path: &Path, gpu: bool) -> (ullm_tokenizer::Tokenizer, LlamaModel, Option<String>) {
+    let resolved = resolve_model_path(path);
+    let path = resolved.as_path();
     let (tk, mut lm, template) = if is_safetensors(path) {
         let st = SafeTensorsModel::open(path).unwrap_or_else(|e| die(e));
         let tk = load_hf_tokenizer(path);
@@ -746,10 +757,14 @@ fn run(
 fn chat(path: &Path, system: Option<&str>, gpu: bool, max_tokens: usize, params: SampleParams) {
     use std::io::{BufRead, Write};
 
-    let (tk, mut lm, template) = load_model(path, gpu);
+    let resolved = resolve_model_path(path);
+    let (tk, mut lm, template) = load_model(&resolved, gpu);
     let fmt = ullm_tokenizer::chat::ChatFormat::detect(template.as_deref());
     let backend = if lm.gpu_enabled() { "gpu" } else { "cpu" };
-    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    let name = resolved
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
 
     // History as (role, content). The system message (if any) is never trimmed.
     let mut history: Vec<(String, String)> = Vec::new();
