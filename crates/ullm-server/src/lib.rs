@@ -25,6 +25,7 @@ use ullm_gguf::GgufModel;
 use ullm_model::{Grammar, GrammarConstraint, LlamaModel, SampleParams, TokenTrie};
 use ullm_safetensors::SafeTensorsModel;
 use ullm_tokenizer::Tokenizer;
+use ullm_tokenizer::chat::{ChatFormat, hf_chat_template};
 
 /// A loaded model + tokenizer, generation-ready.
 struct Engine {
@@ -448,6 +449,7 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
         top_k: 0,
         top_p: req.top_p.unwrap_or(1.0),
         seed: req.seed.unwrap_or(0),
+        ..SampleParams::default()
     };
     let model_id = s.model_id.clone();
 
@@ -464,7 +466,7 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
                     content: plan.system,
                 },
             );
-            let prompt = s.chat_format.build_prompt(&msgs);
+            let prompt = build_prompt(s.chat_format, &msgs);
             let engine = s.engine.clone();
             let grammar = plan.grammar;
             let p = params.clone();
@@ -498,7 +500,7 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
         Ok(None) => {}
     }
 
-    let prompt = s.chat_format.build_prompt(&req.messages);
+    let prompt = build_prompt(s.chat_format, &req.messages);
 
     // Compile the requested structured-output constraint, if any (400 on error).
     let grammar = match request_grammar(&req) {
@@ -752,89 +754,12 @@ fn chunk_json(
     )
 }
 
-/// Read a Hugging Face model's chat template (`chat_template.jinja` or the
-/// `chat_template` field of `tokenizer_config.json`).
-fn hf_chat_template(dir: &Path) -> Option<String> {
-    std::fs::read_to_string(dir.join("chat_template.jinja"))
-        .ok()
-        .or_else(|| {
-            let cfg = std::fs::read_to_string(dir.join("tokenizer_config.json")).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&cfg).ok()?;
-            v.get("chat_template")
-                .and_then(|t| t.as_str())
-                .map(str::to_string)
-        })
-}
-
-/// The chat prompt format a model expects, detected from its chat template.
-#[derive(Clone, Copy, Debug)]
-enum ChatFormat {
-    ChatML,
-    Gemma,
-    Llama3,
-    Zephyr,
-}
-
-impl ChatFormat {
-    /// Pick a format from the model's `chat_template` string (substring markers).
-    fn detect(template: Option<&str>) -> Self {
-        match template {
-            Some(t) if t.contains("<|im_start|>") => ChatFormat::ChatML,
-            Some(t) if t.contains("<start_of_turn>") => ChatFormat::Gemma,
-            Some(t) if t.contains("<|start_header_id|>") => ChatFormat::Llama3,
-            _ => ChatFormat::Zephyr,
-        }
-    }
-
-    /// Render messages into the model's native chat prompt, ending with the
-    /// open assistant turn. Special-token markers tokenize to single ids.
-    fn build_prompt(&self, messages: &[ChatMessage]) -> String {
-        let mut p = String::new();
-        match self {
-            ChatFormat::ChatML => {
-                for m in messages {
-                    let r = norm_role(&m.role, "user");
-                    p.push_str(&format!("<|im_start|>{r}\n{}<|im_end|>\n", m.content));
-                }
-                p.push_str("<|im_start|>assistant\n");
-            }
-            ChatFormat::Gemma => {
-                for m in messages {
-                    // Gemma has no system role; fold it into a user turn.
-                    let r = if m.role == "assistant" {
-                        "model"
-                    } else {
-                        "user"
-                    };
-                    p.push_str(&format!("<start_of_turn>{r}\n{}<end_of_turn>\n", m.content));
-                }
-                p.push_str("<start_of_turn>model\n");
-            }
-            ChatFormat::Llama3 => {
-                for m in messages {
-                    let r = norm_role(&m.role, "user");
-                    p.push_str(&format!(
-                        "<|start_header_id|>{r}<|end_header_id|>\n\n{}<|eot_id|>",
-                        m.content
-                    ));
-                }
-                p.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-            }
-            ChatFormat::Zephyr => {
-                for m in messages {
-                    let r = norm_role(&m.role, "user");
-                    p.push_str(&format!("<|{r}|>\n{}\n", m.content));
-                }
-                p.push_str("<|assistant|>\n");
-            }
-        }
-        p
-    }
-}
-
-fn norm_role<'a>(role: &'a str, default: &'a str) -> &'a str {
-    match role {
-        "system" | "user" | "assistant" => role,
-        _ => default,
-    }
+/// Wrap chat messages in the model's prompt format (`ChatFormat` lives in
+/// `ullm-tokenizer` so the CLI shares it).
+fn build_prompt(fmt: ChatFormat, messages: &[ChatMessage]) -> String {
+    let pairs: Vec<(&str, &str)> = messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.as_str()))
+        .collect();
+    fmt.build_prompt(&pairs)
 }

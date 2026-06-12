@@ -36,7 +36,8 @@ enum Command {
         /// Text to tokenize.
         text: String,
     },
-    /// Generate text from a prompt (greedy decoding on CPU).
+    /// Generate text from a prompt — streamed, with the model's chat template
+    /// (use --raw to disable) and optional structured-output constraints.
     Run {
         /// Path to a `.gguf` model file.
         path: PathBuf,
@@ -57,6 +58,12 @@ enum Command {
         /// RNG seed (0 = fixed default).
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Penalty on recently-used tokens (1.0 = off) — discourages loops.
+        #[arg(long, default_value_t = 1.1)]
+        repeat_penalty: f32,
+        /// Feed the prompt raw, without the model's chat template.
+        #[arg(long)]
+        raw: bool,
         /// Run the forward pass on the Metal GPU.
         #[arg(long)]
         gpu: bool,
@@ -126,6 +133,8 @@ fn main() {
             top_k,
             top_p,
             seed,
+            repeat_penalty,
+            raw,
             gpu,
             grammar,
             schema,
@@ -140,8 +149,11 @@ fn main() {
                 top_k,
                 top_p,
                 seed,
+                repeat_penalty,
+                repeat_last_n: 64,
             },
             gpu,
+            raw,
             grammar.as_deref(),
             schema.as_deref(),
             regex.as_deref(),
@@ -259,7 +271,7 @@ fn grammar_bench(path: &Path) {
 /// Run a prompt through the batched prefill and the token-by-token CPU forward
 /// and confirm the final-position logits match (max abs diff + argmax agree).
 fn prefill_check(path: &Path, prompt: &str) {
-    let (tk, mut lm) = load_model(path, false);
+    let (tk, mut lm, _) = load_model(path, false);
     let ids = tk.encode(prompt, true);
     let r = lm.prefill_check(&ids);
 
@@ -295,8 +307,8 @@ fn prefill_check(path: &Path, prompt: &str) {
 /// Run a prompt through the CPU and GPU forward passes and compare the logits at
 /// the final position (max abs diff + whether the argmax token agrees).
 fn gpu_check(path: &Path, prompt: &str) {
-    let (tk, mut cpu) = load_model(path, false);
-    let (_, mut gpu) = load_model(path, true);
+    let (tk, mut cpu, _) = load_model(path, false);
+    let (_, mut gpu, _) = load_model(path, true);
     let ids = tk.encode(prompt, true);
 
     if std::env::var("ULLM_GPU_DBG").is_ok() {
@@ -562,11 +574,11 @@ fn die(e: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-/// Load a model + tokenizer from a GGUF file or an HF/MLX directory, optionally
-/// moving the forward pass onto the Metal GPU. The single loading path shared by
-/// `run`, `gpu-check` and `prefill-check`.
-fn load_model(path: &Path, gpu: bool) -> (ullm_tokenizer::Tokenizer, LlamaModel) {
-    let (tk, mut lm) = if is_safetensors(path) {
+/// Load a model + tokenizer (and its chat template, if any) from a GGUF file or
+/// an HF/MLX directory, optionally moving the forward pass onto the Metal GPU.
+/// The single loading path shared by `run`, `gpu-check` and `prefill-check`.
+fn load_model(path: &Path, gpu: bool) -> (ullm_tokenizer::Tokenizer, LlamaModel, Option<String>) {
+    let (tk, mut lm, template) = if is_safetensors(path) {
         let st = SafeTensorsModel::open(path).unwrap_or_else(|e| die(e));
         let tk = load_hf_tokenizer(path);
         // MLX models carry a `quantization` block in config.json.
@@ -575,16 +587,21 @@ fn load_model(path: &Path, gpu: bool) -> (ullm_tokenizer::Tokenizer, LlamaModel)
         } else {
             LlamaModel::from_safetensors(&st).unwrap_or_else(|e| die(e))
         };
-        (tk, lm) // `st`'s mmap drops here; `lm` owns copied weights
+        (tk, lm, ullm_tokenizer::chat::hf_chat_template(path)) // `st` drops here
     } else {
         let model = GgufModel::open(path).unwrap_or_else(|e| die(e));
         let tk = model.tokenizer().unwrap_or_else(|e| die(e));
-        (tk, LlamaModel::from_gguf(&model).unwrap_or_else(|e| die(e)))
+        let template = model
+            .metadata_get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let lm = LlamaModel::from_gguf(&model).unwrap_or_else(|e| die(e));
+        (tk, lm, template)
     };
     if gpu {
         lm.enable_gpu().unwrap_or_else(|e| die(e));
     }
-    (tk, lm)
+    (tk, lm, template)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,27 +611,36 @@ fn run(
     max_tokens: usize,
     params: SampleParams,
     gpu: bool,
+    raw: bool,
     grammar_file: Option<&Path>,
     schema_file: Option<&Path>,
     regex: Option<&str>,
     json: bool,
 ) {
+    use std::io::Write;
+
     let t_load = std::time::Instant::now();
-    let (tk, mut lm) = load_model(path, gpu);
+    let (tk, mut lm, template) = load_model(path, gpu);
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    let prompt_ids = tk.encode(prompt, true);
+    // Wrap the prompt in the model's chat template so an instruct model answers
+    // instead of free-completing the raw text. `--raw` (or a base model with no
+    // template) feeds the prompt as-is.
+    let chatted = (!raw)
+        .then_some(template.as_deref())
+        .flatten()
+        .map(|t| ullm_tokenizer::chat::ChatFormat::detect(Some(t)).wrap(prompt));
+    let prompt_ids = tk.encode(chatted.as_deref().unwrap_or(prompt), true);
 
     // Optional grammar constraint (guaranteed-valid structured output). The
     // `grammar` binding must outlive `constraint`, which borrows it.
+    let read = |file: &Path| {
+        std::fs::read_to_string(file).unwrap_or_else(|e| die(format!("{}: {e}", file.display())))
+    };
     let grammar: Option<Grammar> = match (grammar_file, schema_file, regex, json) {
-        (Some(file), ..) => {
-            let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(e));
-            Some(Grammar::from_gbnf(&text).unwrap_or_else(|e| die(e)))
-        }
+        (Some(file), ..) => Some(Grammar::from_gbnf(&read(file)).unwrap_or_else(|e| die(e))),
         (None, Some(file), ..) => {
-            let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(e));
-            Some(Grammar::from_json_schema_str(&text).unwrap_or_else(|e| die(e)))
+            Some(Grammar::from_json_schema_str(&read(file)).unwrap_or_else(|e| die(e)))
         }
         (None, None, Some(re), _) => Some(Grammar::from_regex(re).unwrap_or_else(|e| die(e))),
         (None, None, None, true) => Some(Grammar::json()),
@@ -627,9 +653,12 @@ fn run(
         _ => None,
     };
 
-    // Prefill (process the prompt) timed separately from decode.
+    // Stream the response token-by-token, decoding incrementally.
     let t_gen = std::time::Instant::now();
-    let generated = lm.generate(
+    let mut gen_ids: Vec<u32> = Vec::new();
+    let mut printed = 0usize;
+    let mut out = std::io::stdout();
+    lm.generate_stream(
         &prompt_ids,
         max_tokens,
         tk.eos_id(),
@@ -637,19 +666,26 @@ fn run(
         constraint
             .as_mut()
             .map(|c| c as &mut dyn ullm_model::LogitConstraint),
+        |id| {
+            gen_ids.push(id);
+            let text = tk.decode(&gen_ids);
+            if let Some(delta) = text.get(printed..) {
+                print!("{delta}");
+                let _ = out.flush();
+                printed = text.len();
+            }
+            true
+        },
     );
+    println!();
     let gen_s = t_gen.elapsed().as_secs_f64();
 
-    let mut full = prompt_ids.clone();
-    full.extend_from_slice(&generated);
-    println!("{}", tk.decode(&full));
-
-    let n = generated.len().max(1);
+    let n = gen_ids.len().max(1);
     let backend = if lm.gpu_enabled() { "gpu" } else { "cpu" };
     eprintln!(
-        "\n[perf] {backend} · load {load_ms:.0} ms · {} prompt + {} gen tokens · {:.1} tok/s ({:.1} ms/tok)",
+        "[perf] {backend} · load {load_ms:.0} ms · {} prompt + {} gen tokens · {:.1} tok/s ({:.1} ms/tok)",
         prompt_ids.len(),
-        generated.len(),
+        gen_ids.len(),
         n as f64 / gen_s,
         gen_s * 1e3 / n as f64,
     );

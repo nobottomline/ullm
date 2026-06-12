@@ -14,6 +14,10 @@ pub struct SampleParams {
     pub top_p: f32,
     /// RNG seed (`0` uses a fixed default for reproducibility).
     pub seed: u64,
+    /// Repetition penalty (`1.0` disables). Discourages loops on recent tokens.
+    pub repeat_penalty: f32,
+    /// How many recent tokens the repetition penalty looks back over.
+    pub repeat_last_n: usize,
 }
 
 impl Default for SampleParams {
@@ -23,6 +27,27 @@ impl Default for SampleParams {
             top_k: 0,
             top_p: 1.0,
             seed: 0,
+            repeat_penalty: 1.1,
+            repeat_last_n: 64,
+        }
+    }
+}
+
+/// Penalize tokens that appear in `recent` so greedy/low-temperature decoding
+/// doesn't loop (llama.cpp style: a positive logit is divided by the penalty, a
+/// negative one multiplied). `-inf` (grammar-masked) tokens are left untouched.
+pub(crate) fn apply_repetition_penalty(logits: &mut [f32], recent: &[u32], penalty: f32) {
+    if penalty == 1.0 {
+        return;
+    }
+    for &t in recent {
+        let i = t as usize;
+        if i < logits.len() && logits[i].is_finite() {
+            logits[i] = if logits[i] > 0.0 {
+                logits[i] / penalty
+            } else {
+                logits[i] * penalty
+            };
         }
     }
 }

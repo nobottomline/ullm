@@ -28,7 +28,7 @@ pub use ullm_grammar::{Grammar, GrammarDfa, GrammarState, TokenTrie};
 use math::{
     add_bias, dequant_mlx_row, gelu, matmul_q, matvec_q, rmsnorm, rope, rope_neox, silu, softmax,
 };
-use sample::sample_token;
+use sample::{apply_repetition_penalty, sample_token};
 use weights::{qweight, tensor_f32};
 
 /// Side tables for an MLX 4-bit weight kept resident (group scale + bias),
@@ -898,10 +898,14 @@ impl LlamaModel {
             }
         }
 
+        // Recent-token window for the repetition penalty (prompt + generated).
+        let mut history: Vec<u32> = prompt.to_vec();
         for _ in 0..max_new {
             if pos >= self.config.n_ctx || logits.is_empty() {
                 break;
             }
+            let start = history.len().saturating_sub(params.repeat_last_n);
+            apply_repetition_penalty(&mut logits, &history[start..], params.repeat_penalty);
             if let Some(c) = constraint.as_mut() {
                 c.constrain(&mut logits);
             }
@@ -912,6 +916,7 @@ impl LlamaModel {
             if let Some(c) = constraint.as_mut() {
                 c.accept(next);
             }
+            history.push(next);
             logits = self.forward(next, pos);
             pos += 1;
         }
