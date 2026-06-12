@@ -226,39 +226,59 @@ impl LlamaModel {
     /// `*.safetensors`). Weights are kept in their stored BF16/F16/F32 form and
     /// dequantized per row, exactly as for GGUF.
     pub fn from_safetensors(model: &SafeTensorsModel) -> Result<Self> {
+        // Hyperparameters live under `text_config` for multimodal models, at the
+        // root for plain LLMs. Architecture is keyed off `model_type` (with the
+        // `architectures` list as a fallback); optional features (bias, Q/K-norm)
+        // are detected from the tensors below, not from the architecture name.
+        let tc = model.text_config();
+        let model_type = tc
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| model.config().get("model_type").and_then(|v| v.as_str()));
         let arch_name = model
             .config()
             .get("architectures")
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let arch = match arch_name {
-            "Qwen3ForCausalLM" => Arch::Qwen3,
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "SafeTensors architecture '{other}' is not supported yet (Qwen3)"
-                )));
-            }
-        };
+            .and_then(|v| v.as_str());
+        let arch = Arch::detect(model_type, arch_name).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "SafeTensors model_type '{}' / architecture '{}' is not supported yet \
+                 (Llama, Mistral, Qwen2, Qwen3 and Qwen3 multimodal text decoders)",
+                model_type.unwrap_or("?"),
+                arch_name.unwrap_or("?")
+            ))
+        })?;
+        if arch == Arch::Qwen3Moe {
+            return Err(Error::Unsupported(
+                "mixture-of-experts from SafeTensors is not wired yet — run the MLX 4-bit \
+                 build of this model, or convert it to GGUF"
+                    .into(),
+            ));
+        }
+        if arch == Arch::Gemma3 {
+            return Err(Error::Unsupported(
+                "Gemma-3 from SafeTensors is not wired yet — use the GGUF build".into(),
+            ));
+        }
 
         let req = |k: &str| -> Result<usize> {
-            model
-                .config_usize(k)
+            tc.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
                 .ok_or_else(|| Error::Format(format!("config.json: missing '{k}'")))
         };
+        let cu = |k: &str| tc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+        let cf = |k: &str| tc.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
         let n_embd = req("hidden_size")?;
         let n_head = req("num_attention_heads")?;
         let n_layer = req("num_hidden_layers")?;
-        let n_kv_head = model.config_usize("num_key_value_heads").unwrap_or(n_head);
+        let n_kv_head = cu("num_key_value_heads").unwrap_or(n_head);
         let n_ff = req("intermediate_size")?;
-        let head_dim = model.config_usize("head_dim").unwrap_or(n_embd / n_head);
-        let n_ctx = model
-            .config_usize("max_position_embeddings")
-            .unwrap_or(8192)
-            .min(8192);
-        let rope_theta = model.config_f32("rope_theta").unwrap_or(1_000_000.0);
-        let eps = model.config_f32("rms_norm_eps").unwrap_or(1e-6);
+        let head_dim = cu("head_dim").unwrap_or(n_embd / n_head);
+        let n_ctx = cu("max_position_embeddings").unwrap_or(8192).min(8192);
+        let rope_theta = cf("rope_theta").unwrap_or(1_000_000.0);
+        let eps = cf("rms_norm_eps").unwrap_or(1e-6);
         let vocab_size = req("vocab_size")?;
 
         let config = LlamaConfig {
@@ -279,10 +299,35 @@ impl LlamaModel {
             sliding_window: 0,
         };
 
-        let tok_embeddings = qweight(model, "model.embed_tokens.weight")?;
+        // Multimodal models prefix the text decoder (e.g. `model.language_model.`);
+        // plain LLMs use `model.`. Probe for the layer-0 norm to find the prefix.
+        let prefix = ["model.language_model.", "language_model.model.", "model."]
+            .into_iter()
+            .find(|p| model.has_tensor(&format!("{p}layers.0.input_layernorm.weight")))
+            .ok_or_else(|| {
+                Error::Format("could not locate the decoder layers in the SafeTensors".into())
+            })?;
+
+        // We run standard multi-head attention (q/k/v/o projections). Some recent
+        // models (e.g. Qwen3.5 "linear" / SSM hybrids) swap it for a linear_attn /
+        // Mamba block — fail with a clear message instead of a cryptic missing
+        // q_proj far into loading.
+        if !model.has_tensor(&format!("{prefix}layers.0.self_attn.q_proj.weight")) {
+            let kind = if model.has_tensor(&format!("{prefix}layers.0.linear_attn.A_log")) {
+                "linear (state-space / Mamba-style) attention"
+            } else {
+                "an unsupported attention block (no self_attn.q_proj)"
+            };
+            return Err(Error::Unsupported(format!(
+                "this model uses {kind}, which uLLM does not run yet — only standard \
+                 multi-head attention is supported"
+            )));
+        }
+
+        let tok_embeddings = qweight(model, &format!("{prefix}embed_tokens.weight"))?;
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
-            let p = format!("model.layers.{i}");
+            let p = format!("{prefix}layers.{i}");
             layers.push(LayerWeights {
                 attn_norm: tensor_f32(model, &format!("{p}.input_layernorm.weight"))?,
                 wq: qweight(model, &format!("{p}.self_attn.q_proj.weight"))?,
@@ -306,9 +351,12 @@ impl LlamaModel {
                 experts_down: Vec::new(),
             });
         }
-        let final_norm = tensor_f32(model, "model.norm.weight")?;
-        // Tied embeddings when there is no separate lm_head.
-        let output = qweight(model, "lm_head.weight").unwrap_or_else(|_| tok_embeddings.clone());
+        let final_norm = tensor_f32(model, &format!("{prefix}norm.weight"))?;
+        // The output projection is `lm_head.weight` (at the root or under the
+        // decoder prefix); tied to the input embeddings when absent.
+        let output = qweight(model, "lm_head.weight")
+            .or_else(|_| qweight(model, &format!("{prefix}lm_head.weight")))
+            .unwrap_or_else(|_| tok_embeddings.clone());
 
         let kv_dim = n_kv_head * head_dim;
         let cache = vec![0.0f32; n_layer * n_ctx * kv_dim];

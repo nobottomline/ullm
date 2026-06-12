@@ -171,6 +171,13 @@ impl SafeTensorsModel {
         &self.config
     }
 
+    /// The text-decoder config. Multimodal models (vision/audio + LLM) nest the
+    /// language-model hyperparameters under `text_config`; plain LLMs keep them at
+    /// the root. Returns the nested object when present, else the root config.
+    pub fn text_config(&self) -> &Value {
+        self.config.get("text_config").unwrap_or(&self.config)
+    }
+
     /// Read a `usize` field from `config.json`.
     pub fn config_usize(&self, key: &str) -> Option<usize> {
         self.config
@@ -190,6 +197,11 @@ impl SafeTensorsModel {
     /// Read a string field from `config.json`.
     pub fn config_str(&self, key: &str) -> Option<&str> {
         self.config.get(key).and_then(Value::as_str)
+    }
+
+    /// Whether a tensor with this exact name is present in the shards.
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.get(name).is_some()
     }
 
     /// Path to `tokenizer.json` in the model directory, if present.
