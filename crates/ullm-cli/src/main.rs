@@ -711,10 +711,12 @@ fn run(
         _ => None,
     };
 
-    // Stream the response token-by-token, decoding incrementally.
+    // Stream the response token-by-token, decoding incrementally. Time the
+    // prefill (= time-to-first-token) separately from the decode rate.
     let t_gen = std::time::Instant::now();
     let mut gen_ids: Vec<u32> = Vec::new();
     let mut printed = 0usize;
+    let mut ttft: Option<f64> = None;
     let mut out = std::io::stdout();
     lm.generate_stream(
         &prompt_ids,
@@ -725,6 +727,9 @@ fn run(
             .as_mut()
             .map(|c| c as &mut dyn ullm_model::LogitConstraint),
         |id| {
+            if ttft.is_none() {
+                ttft = Some(t_gen.elapsed().as_secs_f64());
+            }
             gen_ids.push(id);
             let text = tk.decode(&gen_ids);
             // Hold back a trailing replacement char: it's usually an incomplete
@@ -739,16 +744,35 @@ fn run(
         },
     );
     println!();
-    let gen_s = t_gen.elapsed().as_secs_f64();
-
-    let n = gen_ids.len().max(1);
-    let backend = if lm.gpu_enabled() { "gpu" } else { "cpu" };
-    eprintln!(
-        "[perf] {backend} · load {load_ms:.0} ms · {} prompt + {} gen tokens · {:.1} tok/s ({:.1} ms/tok)",
+    perf_line(
+        load_ms,
+        lm.gpu_enabled(),
         prompt_ids.len(),
+        &gen_ids,
+        ttft,
+        t_gen,
+    );
+}
+
+/// Print the `[perf]` line: load, prefill (TTFT) and decode rate separately.
+fn perf_line(
+    load_ms: f64,
+    gpu: bool,
+    prompt_tokens: usize,
+    gen_ids: &[u32],
+    ttft: Option<f64>,
+    t_gen: std::time::Instant,
+) {
+    let total_s = t_gen.elapsed().as_secs_f64();
+    let ttft = ttft.unwrap_or(total_s);
+    let decode_n = gen_ids.len().saturating_sub(1);
+    let decode_s = (total_s - ttft).max(1e-9);
+    let decode_rate = decode_n as f64 / decode_s;
+    let backend = if gpu { "gpu" } else { "cpu" };
+    eprintln!(
+        "[perf] {backend} · load {load_ms:.0} ms · prefill {prompt_tokens} tok in {:.0} ms · decode {} tok @ {decode_rate:.1} tok/s",
+        ttft * 1e3,
         gen_ids.len(),
-        n as f64 / gen_s,
-        gen_s * 1e3 / n as f64,
     );
 }
 
