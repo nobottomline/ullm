@@ -77,9 +77,11 @@ impl Grammar {
         parser::parse(text)
     }
 
-    /// The built-in JSON grammar: any syntactically valid JSON value.
+    /// The built-in JSON grammar: any syntactically valid JSON value. (Equivalent
+    /// to the permissive schema `true`; digit runs are bounded — see `schema`.)
     pub fn json() -> Grammar {
-        Grammar::from_gbnf(JSON_GBNF).expect("built-in JSON grammar is valid")
+        Grammar::from_json_schema(&serde_json::Value::Bool(true))
+            .expect("built-in JSON grammar is valid")
     }
 
     /// Compile a JSON Schema into a grammar that accepts exactly the JSON

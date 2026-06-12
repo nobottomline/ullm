@@ -66,8 +66,15 @@ cargo build --release
 echo 'root ::= "positive" | "negative" | "neutral"' > sentiment.gbnf
 ./target/release/ullm run model.gguf "Sentiment of 'I loved it'. Answer:" --grammar sentiment.gbnf
 
-# OpenAI-compatible server
+# OpenAI-compatible server — with Structured Outputs (a drop-in local OpenAI)
 ./target/release/ullm serve model.gguf --gpu          # http://127.0.0.1:8080
+curl localhost:8080/v1/chat/completions -d '{
+  "messages": [{"role":"user","content":"Extract: Acme blender, 5 stars."}],
+  "response_format": {"type":"json_schema","json_schema":{"schema":{
+    "type":"object",
+    "properties":{"product":{"type":"string"},"rating":{"type":"integer"}},
+    "required":["product","rating"]}}}
+}'   # -> assistant content is guaranteed to match the schema
 
 # Inspect a model, tokenize text, validate the GPU vs CPU forward
 ./target/release/ullm inspect model.gguf

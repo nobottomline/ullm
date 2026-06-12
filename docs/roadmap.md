@@ -39,7 +39,12 @@ level, so invalid output is impossible — on any format, on CPU and GPU.
   number/boolean/null, `properties` + `required` (any-subset optionals), `enum`,
   `const`, `items` + `minItems`, `anyOf`/`oneOf`. Output validated to conform
   with the `jsonschema` reference validator on Qwen3-4B
-- ☐ `response_format` / `grammar` field in the OpenAI server + tool-call schemas
+- ☑ OpenAI **Structured Outputs** in the server — `response_format`
+  `{"type":"json_object"}` and `{"type":"json_schema","json_schema":{"schema":…}}`,
+  plus a `grammar` (GBNF) extension. Validated over HTTP with the `jsonschema`
+  reference validator; a bad request returns 400. A drop-in local replacement
+  for OpenAI structured outputs
+- ☐ Tool/function-call schemas (`tools` → constrained arguments)
 - ☐ Token-trie acceleration for the mask (sub-ms constraint at full vocab)
 - ☐ Regex-constrained decoding (a regex → NFA path); string `pattern`/`format`
 - ☐ Schema `$ref`/`$defs`, `additionalProperties` schema, `maxItems`

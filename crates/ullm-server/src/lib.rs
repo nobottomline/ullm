@@ -22,7 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use ullm_core::{Error, Result};
 use ullm_gguf::GgufModel;
-use ullm_model::{LlamaModel, SampleParams};
+use ullm_model::{Grammar, GrammarConstraint, LlamaModel, SampleParams};
 use ullm_safetensors::SafeTensorsModel;
 use ullm_tokenizer::Tokenizer;
 
@@ -78,20 +78,31 @@ impl Engine {
         })
     }
 
+    /// A grammar constraint bound to this engine's vocabulary, if `grammar` is set.
+    fn constraint<'g>(&self, grammar: Option<&'g Grammar>) -> Option<GrammarConstraint<'g>> {
+        grammar.map(|g| {
+            GrammarConstraint::new(g, self.tokenizer.token_pieces(), self.tokenizer.eos_id())
+        })
+    }
+
     /// Returns (text, prompt_tokens, completion_tokens).
     fn complete(
         &mut self,
         prompt: &str,
         max_tokens: usize,
         params: &SampleParams,
+        grammar: Option<&Grammar>,
     ) -> (String, usize, usize) {
         let prompt_ids = self.tokenizer.encode(prompt, true);
+        let mut constraint = self.constraint(grammar);
         let generated = self.model.generate(
             &prompt_ids,
             max_tokens,
             self.tokenizer.eos_id(),
             params,
-            None,
+            constraint
+                .as_mut()
+                .map(|c| c as &mut dyn ullm_model::LogitConstraint),
         );
         let text = self.tokenizer.decode(&generated);
         (text, prompt_ids.len(), generated.len())
@@ -103,15 +114,20 @@ impl Engine {
         prompt: &str,
         max_tokens: usize,
         params: &SampleParams,
+        grammar: Option<&Grammar>,
         mut on_delta: F,
     ) {
         let prompt_ids = self.tokenizer.encode(prompt, true);
         let eos = self.tokenizer.eos_id();
         let mut all = prompt_ids.clone();
         let mut sent = self.tokenizer.decode(&prompt_ids).len();
+        let mut constraint = self.constraint(grammar);
+        let cons = constraint
+            .as_mut()
+            .map(|c| c as &mut dyn ullm_model::LogitConstraint);
         let tok = &self.tokenizer;
         self.model
-            .generate_stream(&prompt_ids, max_tokens, eos, params, None, |id| {
+            .generate_stream(&prompt_ids, max_tokens, eos, params, cons, |id| {
                 all.push(id);
                 let full = tok.decode(&all);
                 if full.len() > sent {
@@ -218,6 +234,52 @@ struct ChatRequest {
     seed: Option<u64>,
     #[serde(default)]
     stream: Option<bool>,
+    /// OpenAI Structured Outputs: `{"type": "json_object"}` or
+    /// `{"type": "json_schema", "json_schema": {"schema": {...}}}`.
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+    /// uLLM extension: a raw GBNF grammar string (takes precedence).
+    #[serde(default)]
+    grammar: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponseFormat {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    json_schema: Option<JsonSchemaSpec>,
+}
+
+#[derive(Deserialize)]
+struct JsonSchemaSpec {
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
+}
+
+/// Build the decoding constraint requested by a chat request (a raw GBNF
+/// grammar, a JSON Schema, or plain JSON mode). `Ok(None)` means unconstrained.
+fn request_grammar(req: &ChatRequest) -> Result<Option<Grammar>> {
+    if let Some(gbnf) = &req.grammar {
+        return Ok(Some(Grammar::from_gbnf(gbnf)?));
+    }
+    match &req.response_format {
+        Some(rf) => match rf.kind.as_str() {
+            "json_object" => Ok(Some(Grammar::json())),
+            "json_schema" => {
+                let schema = rf
+                    .json_schema
+                    .as_ref()
+                    .and_then(|s| s.schema.as_ref())
+                    .ok_or_else(|| {
+                        Error::Format("response_format json_schema needs a `schema`".into())
+                    })?;
+                Ok(Some(Grammar::from_json_schema(schema)?))
+            }
+            _ => Ok(None), // "text" or unset
+        },
+        None => Ok(None),
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -261,6 +323,18 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
     };
     let model_id = s.model_id.clone();
 
+    // Compile the requested structured-output constraint, if any (400 on error).
+    let grammar = match request_grammar(&req) {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid response_format / grammar: {e}"),
+            )
+                .into_response();
+        }
+    };
+
     if req.stream == Some(true) {
         let (tx, rx) = mpsc::channel::<std::result::Result<Event, Infallible>>(64);
         let engine = s.engine.clone();
@@ -272,7 +346,7 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
             send(chunk_json(&mid, Some("assistant"), None, None));
             {
                 let mut e = engine.lock().expect("engine mutex poisoned");
-                e.complete_stream(&prompt, max_tokens, &params, |delta| {
+                e.complete_stream(&prompt, max_tokens, &params, grammar.as_ref(), |delta| {
                     send(chunk_json(&mid, None, Some(delta), None));
                 });
             }
@@ -285,7 +359,7 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
     let engine = s.engine.clone();
     let (text, pt, ct) = tokio::task::spawn_blocking(move || {
         let mut e = engine.lock().expect("engine mutex poisoned");
-        e.complete(&prompt, max_tokens, &params)
+        e.complete(&prompt, max_tokens, &params, grammar.as_ref())
     })
     .await
     .unwrap_or_else(|_| (String::new(), 0, 0));

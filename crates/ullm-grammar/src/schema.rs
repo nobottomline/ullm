@@ -241,13 +241,18 @@ impl Compiler {
                 "string ::= \"\\\"\" ( [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) )* \"\\\"\"\n",
             );
         }
+        // Digit runs are BOUNDED (no real JSON number needs hundreds of digits):
+        // under greedy constrained decoding an unbounded `[0-9]*` lets a confused
+        // model spiral into endless digits. `d` = up to 18 further digits.
+        let d = bounded_digits(18);
+        let f = bounded_digits(18);
         if self.need_number || self.need_value {
-            out.push_str(
-                "number ::= \"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\n",
-            );
+            out.push_str(&format!(
+                "number ::= \"-\"? (\"0\" | [1-9]{d}) (\".\" [0-9]{f})? ([eE] [-+]? [0-9] [0-9]? [0-9]?)?\n"
+            ));
         }
         if self.need_integer {
-            out.push_str("integer ::= \"-\"? (\"0\" | [1-9] [0-9]*)\n");
+            out.push_str(&format!("integer ::= \"-\"? (\"0\" | [1-9]{d})\n"));
         }
         if self.need_boolean || self.need_value {
             out.push_str("boolean ::= \"true\" | \"false\"\n");
@@ -256,6 +261,12 @@ impl Compiler {
             out.push_str("null ::= \"null\"\n");
         }
     }
+}
+
+/// `n` optional digits, e.g. `bounded_digits(2)` -> ` [0-9]? [0-9]?` — a
+/// repetition `[0-9]{0,n}` expanded for our `*+?`-only GBNF.
+fn bounded_digits(n: usize) -> String {
+    " [0-9]?".repeat(n)
 }
 
 /// Render a JSON value as a GBNF literal that matches its canonical serialization.
