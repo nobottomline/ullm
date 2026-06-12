@@ -60,34 +60,34 @@ object) costs the trie walk *once*; after that the per-token overhead is a flat
 ~34 µs — just writing the cached mask onto the logits — i.e. ~0.2 % of a 60 tok/s
 decode step. The grammar guarantee is effectively free per token.
 
-## Prefill (prompt processing)
+## Prefill (prompt processing → time-to-first-token)
 
-The CPU path processes the whole prompt in one batched forward — each weight is
-dequantized once and reused across every prompt position (`matmul_q`) instead of
-once per token. Numerically identical to the token-by-token path (verify with
-`ullm prefill-check <model>`, max |Δlogit| = 0). Measured on a 277-token prompt,
-Apple M4 Max:
+Prefill runs the whole prompt through one forward pass with a **batched matmul**
+that reads each weight ONCE for all prompt positions, instead of a matvec per
+token. On the GPU the batched kernels (`matmul_bf16` / `matmul_mlx4` /
+`matmul_q4k` / `matmul_q6k`) write K/V straight into the cache and project only
+the last token's logits. Numerically identical to the token-by-token path —
+verify with `ullm prefill-check <model> --gpu` (max |Δlogit| ≤ 6e-5, argmax
+agrees). Measured GPU prefill of a 508-token prompt, Apple M-series:
 
 | Model | Quant | token-by-token | batched | speedup |
 |-------|-------|---------------:|--------:|--------:|
-| Qwen2.5-1.5B (dense) | Q4_K_M | 38.6 s | 14.7 s | **2.63×** |
-| Qwen3-4B-Instruct (dense) | BF16 | 68.3 s | 41.2 s | 1.66× |
-| Qwen3-Coder-30B-A3B (MoE) | MLX 4-bit | 187.4 s | 119.0 s | 1.58× |
+| Qwen3-4B-Instruct (dense) | BF16 | 17.1 s | 4.2 s | **4.07×** |
+| Qwen2.5-1.5B (dense) | Q4_K_M | 3.45 s | 1.96 s | **1.76×** |
+| gemma-3-4b (dense) | Q6_K | 6.6 s | 4.3 s | **1.53×** |
 
-Dense quantized models win most (expensive dequant amortized across the batch).
-The MoE win is smaller because experts are still routed per token; batching the
-expert dispatch and a Metal GEMM prefill are the next steps.
+BF16 wins most: per-token decode is memory-bound, so reading each weight once
+across the batch is a near-4× cut in weight traffic. The k-quants win less — the
+per-token matvec is already heavily tuned, so the batched kernel only pulls ahead
+once its read-once + dequant-once amortization (sub-block-per-lane, weights
+dequantized into registers and reused across the column tile) beats that. Short
+prompts (< 64 tokens) stay on the per-token path, where prefill is already a few
+ms. MoE models also stay per-token (experts are routed per token). The CPU path
+batches too (Llama family), via the same read-once `matmul_q`.
 
-**gemma-3-4b Q6_K is at ~73% of llama.cpp** on the same file. The optimization
-path that got there (decode t/s): 2.7 (CPU) → 5.3 (naive 1-thread-per-row GPU)
-→ 28.7 (simdgroup-per-row) → 53.8 (k-quant block split across all 32 lanes) →
-75.4 (multi-row: NR0 rows per simdgroup, activation reused from registers) →
-80.5 (NR0=2). The multi-row kernels are ported from ggml-metal's
-`kernel_mul_mv_q6_K` / `q4_K`.
-
-The smaller Q4_K models already exceed typical llama.cpp single-stream numbers
-for their size; the remaining gemma gap is per-op dispatch overhead and matvec
-bandwidth (~250 vs ~355 GB/s).
+Next lever for the k-quants: a tiled `mul_mm` kernel (simdgroup-matrix 8×8,
+dequantizing a weight tile into threadgroup memory) — the technique llama.cpp
+uses to reach ~1000+ t/s prefill.
 
 ## Correctness
 
@@ -113,6 +113,9 @@ cargo build --release
 
 # GPU vs CPU correctness
 ./target/release/ullm gpu-check model.gguf
+
+# Prefill: batched vs token-by-token (correctness + speedup), on the GPU
+./target/release/ullm prefill-check model.gguf "<a long prompt>" --gpu
 
 # llama.cpp reference (same file)
 llama-bench -m model.gguf -n 128 -p 0 -ngl 99
