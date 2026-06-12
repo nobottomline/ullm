@@ -74,7 +74,7 @@ pub(crate) fn collect_specials(tokens: &[String], types: &[TokenType]) -> Vec<(S
         })
         .map(|(i, t)| (t.clone(), i as u32))
         .collect();
-    v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    v.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
     v
 }
 

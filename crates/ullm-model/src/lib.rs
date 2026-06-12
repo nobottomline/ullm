@@ -330,14 +330,9 @@ impl LlamaModel {
     /// Run one decoding step for `token` at sequence position `pos`, returning
     /// the logits over the vocabulary. Updates the KV cache in place.
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
-        if self.gpu.is_some() {
+        if let Some(gpu) = self.gpu.as_ref() {
             let x_init = self.embed(token);
-            return self
-                .gpu
-                .as_ref()
-                .unwrap()
-                .forward(&x_init, pos)
-                .expect("gpu forward");
+            return gpu.forward(&x_init, pos).expect("gpu forward");
         }
         if self.config.arch == Arch::Gemma3 {
             self.forward_gemma(token, pos)
