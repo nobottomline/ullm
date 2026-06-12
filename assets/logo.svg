@@ -1,0 +1,28 @@
+<svg width="160" height="160" viewBox="0 0 160 160" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="uLLM">
+  <defs>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8B5CF6"/>
+      <stop offset="0.55" stop-color="#5B8DEF"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(10,10)">
+    <rect width="140" height="140" rx="30" fill="#0A0F22" stroke="url(#acc)" stroke-opacity="0.9" stroke-width="2"/>
+    <g fill="#1C264A">
+      <rect x="18"  y="18"  width="20" height="20" rx="5"/><rect x="46"  y="18"  width="20" height="20" rx="5"/><rect x="74"  y="18"  width="20" height="20" rx="5"/><rect x="102" y="18"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="46"  width="20" height="20" rx="5"/><rect x="46"  y="46"  width="20" height="20" rx="5"/><rect x="74"  y="46"  width="20" height="20" rx="5"/><rect x="102" y="46"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="74"  width="20" height="20" rx="5"/><rect x="46"  y="74"  width="20" height="20" rx="5"/><rect x="74"  y="74"  width="20" height="20" rx="5"/><rect x="102" y="74"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="102" width="20" height="20" rx="5"/><rect x="46"  y="102" width="20" height="20" rx="5"/><rect x="74"  y="102" width="20" height="20" rx="5"/><rect x="102" y="102" width="20" height="20" rx="5"/>
+    </g>
+    <polyline points="28,28 28,56 56,56 56,84 84,84 84,112 112,112" fill="none" stroke="url(#acc)" stroke-width="3.5" stroke-opacity="0.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <g fill="url(#acc)">
+      <rect x="18"  y="18"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="46"  width="20" height="20" rx="5"/>
+      <rect x="46"  y="46"  width="20" height="20" rx="5"/>
+      <rect x="46"  y="74"  width="20" height="20" rx="5"/>
+      <rect x="74"  y="74"  width="20" height="20" rx="5"/>
+      <rect x="74"  y="102" width="20" height="20" rx="5"/>
+      <rect x="102" y="102" width="20" height="20" rx="5"/>
+    </g>
+  </g>
+</svg>

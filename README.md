@@ -1,8 +1,12 @@
-# uLLM
+<p align="center">
+  <img src="assets/banner.svg" alt="uLLM — the local inference engine where the model obeys" width="840">
+</p>
 
-[![CI](https://github.com/nobottomline/ullm/actions/workflows/ci.yml/badge.svg)](https://github.com/nobottomline/ullm/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](rust-toolchain.toml)
+<p align="center">
+  <a href="https://github.com/nobottomline/ullm/actions/workflows/ci.yml"><img src="https://github.com/nobottomline/ullm/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-2024-orange.svg" alt="Rust 2024"></a>
+</p>
 
 **The local inference engine where the model obeys.** Bring any model you
 already have — GGUF, Hugging Face, or Apple MLX — and get output *guaranteed* to

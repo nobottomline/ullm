@@ -1,0 +1,60 @@
+<svg width="1200" height="300" viewBox="0 0 1200 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="uLLM — the local inference engine where the model obeys">
+  <defs>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8B5CF6"/>
+      <stop offset="0.55" stop-color="#5B8DEF"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1020"/>
+      <stop offset="1" stop-color="#0E1830"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.13" cy="0.5" r="0.55">
+      <stop offset="0" stop-color="#7C5CFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#7C5CFF" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.6" fill="#5E6FB0" fill-opacity="0.07"/>
+    </pattern>
+  </defs>
+
+  <!-- background card -->
+  <rect width="1200" height="300" rx="26" fill="url(#bg)"/>
+  <rect width="1200" height="300" rx="26" fill="url(#dots)"/>
+  <rect width="1200" height="300" rx="26" fill="url(#glow)"/>
+  <rect x="1" y="1" width="1198" height="298" rx="25" fill="none" stroke="#2A3358" stroke-opacity="0.6"/>
+
+  <!-- mark: a constrained path through a grid of states (constrained decoding) -->
+  <g transform="translate(78,80)">
+    <rect width="140" height="140" rx="30" fill="#0A0F22" stroke="url(#acc)" stroke-opacity="0.85" stroke-width="2"/>
+    <!-- dim grid -->
+    <g fill="#1C264A">
+      <rect x="18"  y="18"  width="20" height="20" rx="5"/><rect x="46"  y="18"  width="20" height="20" rx="5"/><rect x="74"  y="18"  width="20" height="20" rx="5"/><rect x="102" y="18"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="46"  width="20" height="20" rx="5"/><rect x="46"  y="46"  width="20" height="20" rx="5"/><rect x="74"  y="46"  width="20" height="20" rx="5"/><rect x="102" y="46"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="74"  width="20" height="20" rx="5"/><rect x="46"  y="74"  width="20" height="20" rx="5"/><rect x="74"  y="74"  width="20" height="20" rx="5"/><rect x="102" y="74"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="102" width="20" height="20" rx="5"/><rect x="46"  y="102" width="20" height="20" rx="5"/><rect x="74"  y="102" width="20" height="20" rx="5"/><rect x="102" y="102" width="20" height="20" rx="5"/>
+    </g>
+    <!-- the allowed path -->
+    <polyline points="28,28 28,56 56,56 56,84 84,84 84,112 112,112" fill="none" stroke="url(#acc)" stroke-width="3.5" stroke-opacity="0.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <g fill="url(#acc)">
+      <rect x="18"  y="18"  width="20" height="20" rx="5"/>
+      <rect x="18"  y="46"  width="20" height="20" rx="5"/>
+      <rect x="46"  y="46"  width="20" height="20" rx="5"/>
+      <rect x="46"  y="74"  width="20" height="20" rx="5"/>
+      <rect x="74"  y="74"  width="20" height="20" rx="5"/>
+      <rect x="74"  y="102" width="20" height="20" rx="5"/>
+      <rect x="102" y="102" width="20" height="20" rx="5"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="266" y="156" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="96" font-weight="800" letter-spacing="-3">
+    <tspan fill="url(#acc)">u</tspan><tspan fill="#F4F7FF">LLM</tspan>
+  </text>
+
+  <!-- accent rule -->
+  <rect x="270" y="176" width="150" height="3" rx="1.5" fill="url(#acc)" fill-opacity="0.8"/>
+
+  <!-- tagline -->
+  <text x="270" y="212" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22" fill="#94A3C4" letter-spacing="0.5">the local inference engine where the model obeys</text>
+</svg>
