@@ -44,7 +44,12 @@ level, so invalid output is impossible — on any format, on CPU and GPU.
   plus a `grammar` (GBNF) extension. Validated over HTTP with the `jsonschema`
   reference validator; a bad request returns 400. A drop-in local replacement
   for OpenAI structured outputs
-- ☐ Tool/function-call schemas (`tools` → constrained arguments)
+- ☑ Tool / function calling — `tools` + `tool_choice` (`auto`/`required`/named/
+  `none`) constrain generation to a valid call (anyOf over `{name: const,
+  arguments: <params schema>}`, reusing the schema compiler); returns OpenAI
+  `tool_calls`. Validated on Qwen3-4B: right tool picked, arguments conform to
+  the function schema; forced `tool_choice` and unknown-function 400 both work
+- ☐ Streaming `tool_calls` deltas (tool calls are non-streamed today)
 - ☐ Token-trie acceleration for the mask (sub-ms constraint at full vocab)
 - ☐ Regex-constrained decoding (a regex → NFA path); string `pattern`/`format`
 - ☐ Schema `$ref`/`$defs`, `additionalProperties` schema, `maxItems`

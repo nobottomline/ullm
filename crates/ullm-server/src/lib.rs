@@ -241,6 +241,13 @@ struct ChatRequest {
     /// uLLM extension: a raw GBNF grammar string (takes precedence).
     #[serde(default)]
     grammar: Option<String>,
+    /// OpenAI function/tool definitions. When present (and `tool_choice` is not
+    /// `"none"`), generation is constrained to a valid call of one of them.
+    #[serde(default)]
+    tools: Option<Vec<Tool>>,
+    /// `"none"` | `"auto"` | `"required"` | `{"type":"function","function":{"name":..}}`.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +256,22 @@ struct ResponseFormat {
     kind: String,
     #[serde(default)]
     json_schema: Option<JsonSchemaSpec>,
+}
+
+#[derive(Deserialize)]
+struct Tool {
+    #[serde(default)]
+    function: ToolFunction,
+}
+
+#[derive(Deserialize, Default)]
+struct ToolFunction {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    parameters: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -282,6 +305,84 @@ fn request_grammar(req: &ChatRequest) -> Result<Option<Grammar>> {
     }
 }
 
+/// What a tool-calling request resolves to: a grammar that forces a valid call,
+/// and a system message describing the tools for the model.
+struct ToolPlan {
+    grammar: Grammar,
+    system: String,
+}
+
+/// If the request asks for tool calls, build the constraint + tool description.
+/// `Ok(None)` means no tool calling (no tools, or `tool_choice: "none"`).
+fn tool_plan(req: &ChatRequest) -> Result<Option<ToolPlan>> {
+    let Some(tools) = req.tools.as_ref().filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let choice = req.tool_choice.as_ref();
+    if choice.and_then(|c| c.as_str()) == Some("none") {
+        return Ok(None);
+    }
+    // A named `tool_choice` restricts to that one function.
+    let forced = choice
+        .and_then(|c| c.get("function"))
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str());
+    let selected: Vec<&Tool> = match forced {
+        Some(name) => vec![
+            tools
+                .iter()
+                .find(|t| t.function.name == name)
+                .ok_or_else(|| {
+                    Error::Format(format!("tool_choice names unknown function {name:?}"))
+                })?,
+        ],
+        None => tools.iter().collect(),
+    };
+
+    // Each tool -> {"name": const, "arguments": <params schema>}; the call is an
+    // anyOf over them. Reuses the JSON-Schema compiler (const/anyOf/object).
+    let variant = |t: &Tool| {
+        let params = t
+            .function
+            .parameters
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+        serde_json::json!({
+            "type": "object",
+            "properties": { "name": { "const": t.function.name }, "arguments": params },
+            "required": ["name", "arguments"]
+        })
+    };
+    let variants: Vec<serde_json::Value> = selected.iter().map(|t| variant(t)).collect();
+    let schema = if variants.len() == 1 {
+        variants.into_iter().next().unwrap()
+    } else {
+        serde_json::json!({ "anyOf": variants })
+    };
+    let grammar = Grammar::from_json_schema(&schema)?;
+
+    let mut system =
+        String::from("You can call functions to answer the user.\nAvailable functions:\n");
+    for t in &selected {
+        let params = t
+            .function
+            .parameters
+            .as_ref()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "{}".into());
+        let desc = t.function.description.as_deref().unwrap_or("");
+        system.push_str(&format!(
+            "- {} — {desc} (parameters: {params})\n",
+            t.function.name
+        ));
+    }
+    system.push_str(
+        "Call exactly one function. Reply with ONLY a JSON object \
+         {\"name\": <function>, \"arguments\": {<arguments>}} and nothing else.",
+    );
+    Ok(Some(ToolPlan { grammar, system }))
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 struct ChatMessage {
     role: String,
@@ -301,8 +402,33 @@ struct ChatResponse {
 #[derive(Serialize)]
 struct ChatChoice {
     index: usize,
-    message: ChatMessage,
+    message: OutMessage,
     finish_reason: &'static str,
+}
+
+/// An assistant response message: either text `content` or `tool_calls`.
+#[derive(Serialize)]
+struct OutMessage {
+    role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallOut>>,
+}
+
+#[derive(Serialize)]
+struct ToolCallOut {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: FnOut,
+}
+
+#[derive(Serialize)]
+struct FnOut {
+    name: String,
+    /// OpenAI sends arguments as a JSON *string*.
+    arguments: String,
 }
 
 #[derive(Serialize)]
@@ -312,8 +438,11 @@ struct Usage {
     total_tokens: usize,
 }
 
+fn bad_request(msg: String) -> Response {
+    (axum::http::StatusCode::BAD_REQUEST, msg).into_response()
+}
+
 async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
-    let prompt = s.chat_format.build_prompt(&req.messages);
     let max_tokens = req.max_tokens.unwrap_or(128);
     let params = SampleParams {
         temperature: req.temperature.unwrap_or(0.0),
@@ -323,22 +452,47 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
     };
     let model_id = s.model_id.clone();
 
+    // Tool calling takes precedence: constrain to a valid function call, render
+    // the tools into a system message, and return `tool_calls` (non-streaming).
+    match tool_plan(&req) {
+        Err(e) => return bad_request(format!("invalid tools: {e}")),
+        Ok(Some(plan)) => {
+            let mut msgs = req.messages.clone();
+            msgs.insert(
+                0,
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: plan.system,
+                },
+            );
+            let prompt = s.chat_format.build_prompt(&msgs);
+            let engine = s.engine.clone();
+            let grammar = plan.grammar;
+            let p = params.clone();
+            let (text, pt, ct) = tokio::task::spawn_blocking(move || {
+                let mut e = engine.lock().expect("engine mutex poisoned");
+                e.complete(&prompt, max_tokens, &p, Some(&grammar))
+            })
+            .await
+            .unwrap_or_else(|_| (String::new(), 0, 0));
+            return tool_call_response(model_id, &text, pt, ct);
+        }
+        Ok(None) => {}
+    }
+
+    let prompt = s.chat_format.build_prompt(&req.messages);
+
     // Compile the requested structured-output constraint, if any (400 on error).
     let grammar = match request_grammar(&req) {
         Ok(g) => g,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("invalid response_format / grammar: {e}"),
-            )
-                .into_response();
-        }
+        Err(e) => return bad_request(format!("invalid response_format / grammar: {e}")),
     };
 
     if req.stream == Some(true) {
         let (tx, rx) = mpsc::channel::<std::result::Result<Event, Infallible>>(64);
         let engine = s.engine.clone();
         let mid = model_id;
+        let p = params.clone();
         tokio::task::spawn_blocking(move || {
             let send = |data: String| {
                 let _ = tx.blocking_send(Ok(Event::default().data(data)));
@@ -346,7 +500,7 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
             send(chunk_json(&mid, Some("assistant"), None, None));
             {
                 let mut e = engine.lock().expect("engine mutex poisoned");
-                e.complete_stream(&prompt, max_tokens, &params, grammar.as_ref(), |delta| {
+                e.complete_stream(&prompt, max_tokens, &p, grammar.as_ref(), |delta| {
                     send(chunk_json(&mid, None, Some(delta), None));
                 });
             }
@@ -371,11 +525,73 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
         model: model_id,
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatMessage {
-                role: "assistant".to_string(),
-                content: text.trim().to_string(),
+            message: OutMessage {
+                role: "assistant",
+                content: Some(text.trim().to_string()),
+                tool_calls: None,
             },
             finish_reason: "stop",
+        }],
+        usage: Usage {
+            prompt_tokens: pt,
+            completion_tokens: ct,
+            total_tokens: pt + ct,
+        },
+    })
+    .into_response()
+}
+
+/// Turn the (grammar-constrained) model output into an OpenAI `tool_calls`
+/// response. Falls back to plain content if it somehow isn't a `{name,...}`.
+fn tool_call_response(model_id: String, text: &str, pt: usize, ct: usize) -> Response {
+    let trimmed = text.trim();
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+    let (message, finish) = match parsed.as_ref().filter(|v| v.get("name").is_some()) {
+        Some(v) => {
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let arguments = v
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let arg_str = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into());
+            (
+                OutMessage {
+                    role: "assistant",
+                    content: None,
+                    tool_calls: Some(vec![ToolCallOut {
+                        id: format!("call_{name}"),
+                        kind: "function",
+                        function: FnOut {
+                            name,
+                            arguments: arg_str,
+                        },
+                    }]),
+                },
+                "tool_calls",
+            )
+        }
+        None => (
+            OutMessage {
+                role: "assistant",
+                content: Some(trimmed.to_string()),
+                tool_calls: None,
+            },
+            "stop",
+        ),
+    };
+    Json(ChatResponse {
+        id: "chatcmpl-ullm".to_string(),
+        object: "chat.completion",
+        created: unix_now(),
+        model: model_id,
+        choices: vec![ChatChoice {
+            index: 0,
+            message,
+            finish_reason: finish,
         }],
         usage: Usage {
             prompt_tokens: pt,

@@ -22,6 +22,10 @@ with no retries and no JSON-repair. Pure Rust, Apple-Silicon-first, embeddable.
   the contract are impossible to sample. `--json` always yields parseable JSON;
   `--grammar sentiment.gbnf` forces an answer from a fixed set. Works on **every
   format** (GGUF / HF / MLX) and on **CPU and GPU**.
+- **OpenAI-compatible Structured Outputs & tool calling** — the server honors
+  `response_format` (`json_object` / `json_schema`), `tools` + `tool_choice`
+  (returning `tool_calls` whose arguments are *guaranteed* to match the function
+  schema), and a raw `grammar` extension. A drop-in local OpenAI for agents.
 - **Loads three formats through one runtime** — GGUF (llama.cpp), SafeTensors
   (Hugging Face), and Apple MLX (4-bit) — via a container-agnostic `WeightSource`.
 - **Architectures:** Llama 2/3, Qwen2, Qwen3, **Qwen3-MoE**, Gemma-3.
