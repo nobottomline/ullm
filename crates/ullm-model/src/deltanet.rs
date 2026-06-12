@@ -13,6 +13,8 @@
 //! f32 in the test); [`deltanet_core`] is the validated recurrence in between.
 // Validated against transformers here; wired into the hybrid forward next.
 #![allow(dead_code)]
+// Index loops mirror the reference math (per-head/per-dim); clearer than iterators.
+#![allow(clippy::needless_range_loop)]
 
 /// Geometry of a Gated-DeltaNet block.
 #[derive(Clone, Copy, Debug)]
@@ -168,6 +170,130 @@ pub fn deltanet_core(
     normed
 }
 
+/// Persistent recurrent state for one linear-attention layer during decoding —
+/// the analogue of the KV cache for softmax attention. `recur` is the
+/// `[head_k, head_v]` delta-rule state per value head; `conv` is the ring of the
+/// last `conv_kernel-1` projected `qkv` vectors feeding the causal conv.
+pub struct DeltaNetState {
+    pub recur: Vec<f32>, // [n_v_heads * head_k * head_v]
+    pub conv: Vec<f32>,  // [(conv_kernel - 1) * conv_dim]
+}
+
+impl DeltaNetState {
+    pub fn new(d: &DeltaNetDims) -> Self {
+        Self {
+            recur: vec![0.0; d.n_v_heads * d.head_k * d.head_v],
+            conv: vec![0.0; (d.conv_kernel - 1) * d.conv_dim()],
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.recur.iter_mut().for_each(|x| *x = 0.0);
+        self.conv.iter_mut().for_each(|x| *x = 0.0);
+    }
+}
+
+/// One decode step: advance `state` with the current token's projected
+/// `(qkv, z, b, a)` and return its normed core output `[value_dim]` (ready for
+/// `out_proj`). Running this token-by-token reproduces [`deltanet_core`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn deltanet_step(
+    state: &mut DeltaNetState,
+    qkv: &[f32], // [conv_dim]
+    z: &[f32],   // [value_dim]
+    b: &[f32],   // [n_v_heads]
+    a: &[f32],   // [n_v_heads]
+    conv1d: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    norm: &[f32],
+    d: DeltaNetDims,
+) -> Vec<f32> {
+    let (hk, hv, dk, dv, k) = (d.n_k_heads, d.n_v_heads, d.head_k, d.head_v, d.conv_kernel);
+    let key_dim = d.key_dim();
+    let value_dim = d.value_dim();
+    let conv_dim = d.conv_dim();
+    let kk1 = k - 1; // conv history length
+
+    // Causal conv1d over [history | current] + SiLU, then slide the history.
+    let mut conv = vec![0f32; conv_dim];
+    for c in 0..conv_dim {
+        let mut acc = conv1d[c * k + kk1] * qkv[c];
+        for w in 0..kk1 {
+            acc += conv1d[c * k + w] * state.conv[w * conv_dim + c];
+        }
+        conv[c] = silu(acc);
+    }
+    if kk1 > 0 {
+        for s in 0..kk1 - 1 {
+            for c in 0..conv_dim {
+                state.conv[s * conv_dim + c] = state.conv[(s + 1) * conv_dim + c];
+            }
+        }
+        state.conv[(kk1 - 1) * conv_dim..].copy_from_slice(&qkv[..conv_dim]);
+    }
+
+    // One gated delta-rule recurrence step per value head.
+    let rep = hv / hk;
+    let scale = 1.0 / (dk as f32).sqrt();
+    let mut core = vec![0f32; value_dim];
+    let mut q = vec![0f32; dk];
+    let mut key = vec![0f32; dk];
+    for h in 0..hv {
+        let kh = h / rep;
+        let mut qn = 0f32;
+        let mut kn = 0f32;
+        for i in 0..dk {
+            q[i] = conv[kh * dk + i];
+            key[i] = conv[key_dim + kh * dk + i];
+            qn += q[i] * q[i];
+            kn += key[i] * key[i];
+        }
+        let qinv = (qn + 1e-6).sqrt().recip() * scale;
+        let kinv = (kn + 1e-6).sqrt().recip();
+        for i in 0..dk {
+            q[i] *= qinv;
+            key[i] *= kinv;
+        }
+        let g_t = (-a_log[h].exp() * softplus(a[h] + dt_bias[h])).exp();
+        let beta_t = sigmoid(b[h]);
+        let s0 = h * dk * dv;
+        for x in &mut state.recur[s0..s0 + dk * dv] {
+            *x *= g_t;
+        }
+        let voff = 2 * key_dim + h * dv;
+        for j in 0..dv {
+            let mut kv_mem = 0f32;
+            for i in 0..dk {
+                kv_mem += state.recur[s0 + i * dv + j] * key[i];
+            }
+            let delta = (conv[voff + j] - kv_mem) * beta_t;
+            let mut out = 0f32;
+            for i in 0..dk {
+                let sij = state.recur[s0 + i * dv + j] + key[i] * delta;
+                state.recur[s0 + i * dv + j] = sij;
+                out += sij * q[i];
+            }
+            core[h * dv + j] = out;
+        }
+    }
+
+    // Gated RMSNorm per value head.
+    let mut normed = vec![0f32; value_dim];
+    for h in 0..hv {
+        let off = h * dv;
+        let mut var = 0f32;
+        for j in 0..dv {
+            var += core[off + j] * core[off + j];
+        }
+        let inv = (var / dv as f32 + d.eps).sqrt().recip();
+        for j in 0..dv {
+            normed[off + j] = core[off + j] * inv * norm[j] * silu(z[off + j]);
+        }
+    }
+    normed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +413,87 @@ mod tests {
             max_diff < 1e-4,
             "Gated-DeltaNet forward differs from transformers: max|Δ| = {max_diff}"
         );
+    }
+
+    #[test]
+    fn step_matches_core() {
+        // The token-by-token decode path (deltanet_step + persistent state) must
+        // reproduce the whole-sequence deltanet_core bit-for-bit (same math).
+        let v: Value = serde_json::from_str(include_str!("testdata/deltanet_ref.json")).unwrap();
+        let c = &v["config"];
+        let g = |k: &str| c[k].as_u64().unwrap() as usize;
+        let d = DeltaNetDims {
+            hidden: g("hidden_size"),
+            n_v_heads: g("num_v_heads"),
+            n_k_heads: g("num_k_heads"),
+            head_k: g("head_k_dim"),
+            head_v: g("head_v_dim"),
+            conv_kernel: g("conv_kernel"),
+            eps: c["eps"].as_f64().unwrap() as f32,
+        };
+        let seq = g("seq");
+        let input: Vec<f32> = v["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        let qkv = matmul(
+            &input,
+            &arr(&v, "in_proj_qkv.weight"),
+            seq,
+            d.hidden,
+            d.conv_dim(),
+        );
+        let z = matmul(
+            &input,
+            &arr(&v, "in_proj_z.weight"),
+            seq,
+            d.hidden,
+            d.value_dim(),
+        );
+        let b = matmul(
+            &input,
+            &arr(&v, "in_proj_b.weight"),
+            seq,
+            d.hidden,
+            d.n_v_heads,
+        );
+        let a = matmul(
+            &input,
+            &arr(&v, "in_proj_a.weight"),
+            seq,
+            d.hidden,
+            d.n_v_heads,
+        );
+        let (conv1d, alog, dtb, nrm) = (
+            arr(&v, "conv1d.weight"),
+            arr(&v, "A_log"),
+            arr(&v, "dt_bias"),
+            arr(&v, "norm.weight"),
+        );
+        let core = deltanet_core(&qkv, &z, &b, &a, &conv1d, &alog, &dtb, &nrm, d, seq);
+
+        let (cd, vd, hv) = (d.conv_dim(), d.value_dim(), d.n_v_heads);
+        let mut st = DeltaNetState::new(&d);
+        let mut max_diff = 0f32;
+        for t in 0..seq {
+            let out = deltanet_step(
+                &mut st,
+                &qkv[t * cd..(t + 1) * cd],
+                &z[t * vd..(t + 1) * vd],
+                &b[t * hv..(t + 1) * hv],
+                &a[t * hv..(t + 1) * hv],
+                &conv1d,
+                &alog,
+                &dtb,
+                &nrm,
+                d,
+            );
+            for j in 0..vd {
+                max_diff = max_diff.max((out[j] - core[t * vd + j]).abs());
+            }
+        }
+        assert!(max_diff < 1e-5, "step vs core differ: max|Δ| = {max_diff}");
     }
 }
