@@ -43,8 +43,9 @@ enum Command {
         path: PathBuf,
         /// The prompt text.
         prompt: String,
-        /// Maximum number of new tokens to generate.
-        #[arg(long, default_value_t = 64)]
+        /// Cap on generated tokens (generation also stops at EOS / the context
+        /// limit). A safety bound; raise it for long answers.
+        #[arg(long, default_value_t = 512)]
         max_tokens: usize,
         /// Sampling temperature (0 = greedy / deterministic).
         #[arg(long, default_value_t = 0.0)]

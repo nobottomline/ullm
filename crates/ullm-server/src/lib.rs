@@ -443,7 +443,7 @@ fn bad_request(msg: String) -> Response {
 }
 
 async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
-    let max_tokens = req.max_tokens.unwrap_or(128);
+    let max_tokens = req.max_tokens.unwrap_or(512);
     let params = SampleParams {
         temperature: req.temperature.unwrap_or(0.0),
         top_k: 0,
