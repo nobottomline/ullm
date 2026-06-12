@@ -24,8 +24,12 @@ pub(crate) fn schema_to_gbnf(schema: &Value) -> Result<String> {
         ..Compiler::default()
     };
     let root = c.visit(schema)?;
-    let mut out = format!("root ::= ws {root} ws\n");
-    out.push_str("ws ::= [ \\t\\n\\r]*\n");
+    // No surrounding whitespace: structured output should start at the value, and
+    // an unbounded leading `ws` lets a greedy model emit whitespace forever.
+    let mut out = format!("root ::= {root}\n");
+    // Inter-token whitespace is bounded for the same reason (32 is ample for
+    // indentation); see `bounded_ws`.
+    out.push_str(&format!("ws ::= {}\n", bounded_ws(32)));
     c.emit_primitives(&mut out);
     for rule in &c.rules {
         out.push_str(rule);
@@ -153,10 +157,7 @@ impl Compiler {
         Ok(match t {
             "object" => self.visit_object(obj)?,
             "array" => self.visit_array(obj)?,
-            "string" => {
-                self.need_string = true;
-                "string".into()
-            }
+            "string" => self.visit_string(obj)?,
             "integer" => {
                 self.need_integer = true;
                 "integer".into()
@@ -175,6 +176,32 @@ impl Compiler {
             }
             other => return Err(Error::Unsupported(format!("JSON Schema type {other:?}"))),
         })
+    }
+
+    /// A string, optionally constrained by `pattern` (a regex) or `format`
+    /// (a known regex). The regex matches the *content* between the quotes.
+    fn visit_string(&mut self, obj: &serde_json::Map<String, Value>) -> Result<String> {
+        let pattern = obj
+            .get("pattern")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                obj.get("format")
+                    .and_then(Value::as_str)
+                    .and_then(format_pattern)
+                    .map(str::to_string)
+            });
+        match pattern {
+            Some(p) => {
+                let body = crate::regex::regex_to_gbnf(&p)?;
+                // A JSON string whose content matches the regex: `"` body `"`.
+                Ok(self.add(format!("\"\\\"\" {body} \"\\\"\"")))
+            }
+            None => {
+                self.need_string = true;
+                Ok("string".into())
+            }
+        }
     }
 
     fn visit_array(&mut self, obj: &serde_json::Map<String, Value>) -> Result<String> {
@@ -310,6 +337,28 @@ impl Compiler {
 /// repetition `[0-9]{0,n}` expanded for our `*+?`-only GBNF.
 fn bounded_digits(n: usize) -> String {
     " [0-9]?".repeat(n)
+}
+
+/// Up to `n` whitespace characters (`[ \t\n\r]{0,n}`), expanded for `*+?` GBNF.
+fn bounded_ws(n: usize) -> String {
+    let unit = "[ \\t\\n\\r]?";
+    vec![unit; n].join(" ")
+}
+
+/// Map a well-known JSON Schema `format` to a regex (positive classes only, so
+/// the string content can never contain a `"` that would break the JSON).
+fn format_pattern(format: &str) -> Option<&'static str> {
+    Some(match format {
+        "date" => r"[0-9]{4}-[0-9]{2}-[0-9]{2}",
+        "time" => r"[0-9]{2}:[0-9]{2}:[0-9]{2}",
+        "date-time" => {
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})?"
+        }
+        "email" => r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        "uuid" => r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        "ipv4" => r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}",
+        _ => return None,
+    })
 }
 
 /// Render a JSON value as a GBNF literal that matches its canonical serialization.
@@ -487,6 +536,25 @@ mod tests {
                 "]", "}"
             ]
         ));
+    }
+
+    #[test]
+    fn string_format_and_pattern() {
+        // format: date -> the string content must be a date.
+        let schema = json!({ "type": "string", "format": "date" });
+        let g = Grammar::from_json_schema(&schema).unwrap();
+        assert!(run(&g, &["\"", "2024", "-", "01", "-", "15", "\""]));
+
+        // pattern: a fixed product code AB-1234.
+        let schema = json!({ "type": "string", "pattern": r"[A-Z]{2}-[0-9]{4}" });
+        let g = Grammar::from_json_schema(&schema).unwrap();
+        assert!(run(&g, &["\"", "AB", "-", "1234", "\""]));
+        let mut st = GrammarState::new(&g);
+        st.accept_token(b"\"");
+        let ps = pieces(&["A", "9"]);
+        let mut mask = vec![false; ps.len()];
+        st.allowed_mask(&ps, &mut mask);
+        assert!(mask[0] && !mask[1], "code must start with a letter");
     }
 
     #[test]

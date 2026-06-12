@@ -17,11 +17,13 @@ with no retries and no JSON-repair. Pure Rust, Apple-Silicon-first, embeddable.
 
 ## What it does today
 
-- **Guaranteed structured output** — a GBNF grammar (or the built-in JSON
-  grammar) constrains decoding at the logit level, so tokens that would break
-  the contract are impossible to sample. `--json` always yields parseable JSON;
-  `--grammar sentiment.gbnf` forces an answer from a fixed set. Works on **every
-  format** (GGUF / HF / MLX) and on **CPU and GPU**.
+- **Guaranteed structured output** — a GBNF grammar, a JSON Schema, or a regex
+  constrains decoding at the logit level, so tokens that would break the contract
+  are impossible to sample. `--json` always yields parseable JSON; `--schema`
+  (incl. `$ref` / recursion, `enum`, `pattern`/`format`) yields schema-conforming
+  JSON; `--regex` matches a pattern; `--grammar` runs an arbitrary GBNF grammar.
+  Works on **every format** (GGUF / HF / MLX) and on **CPU and GPU**, with the
+  per-token cost cached down to ~tens of µs.
 - **OpenAI-compatible Structured Outputs & tool calling** — the server honors
   `response_format` (`json_object` / `json_schema`), `tools` + `tool_choice`
   (returning `tool_calls` whose arguments are *guaranteed* to match the function
@@ -66,6 +68,8 @@ cargo build --release
 ./target/release/ullm run model.gguf "Extract name and age: John is 30." --json --gpu
 # ...conforming to a JSON Schema (right keys, types, enums — provably valid)...
 ./target/release/ullm run model.gguf "Review: great blender, 5 stars." --schema grammars/review.schema.json --gpu
+# ...matching a regular expression (a date, an ID, a phone number)...
+./target/release/ullm run model.gguf "The date two days after 2024-01-13 is" --regex '[0-9]{4}-[0-9]{2}-[0-9]{2}'
 # ...or constrained to your own grammar (e.g. a fixed label set).
 echo 'root ::= "positive" | "negative" | "neutral"' > sentiment.gbnf
 ./target/release/ullm run model.gguf "Sentiment of 'I loved it'. Answer:" --grammar sentiment.gbnf

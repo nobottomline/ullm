@@ -15,6 +15,7 @@
 //! a known limitation (see `docs/`).
 
 mod parser;
+mod regex;
 mod schema;
 mod trie;
 
@@ -91,6 +92,12 @@ impl Grammar {
     /// the `schema` module for the supported keyword subset.
     pub fn from_json_schema(schema: &serde_json::Value) -> Result<Grammar> {
         Grammar::from_gbnf(&schema::schema_to_gbnf(schema)?)
+    }
+
+    /// Compile a regular expression into a grammar matching it (whole output).
+    /// Supports a common regex subset — see the `regex` module.
+    pub fn from_regex(pattern: &str) -> Result<Grammar> {
+        Grammar::from_gbnf(&format!("root ::= {}", regex::regex_to_gbnf(pattern)?))
     }
 
     /// Compile a JSON Schema given as a JSON string.
@@ -597,6 +604,28 @@ mod tests {
         let mut mask = vec![false; pieces.len()];
         st.allowed_mask(&pieces, &mut mask);
         assert!(mask[0] && mask[1] && !mask[2]);
+    }
+
+    #[test]
+    fn regex_date_pattern() {
+        let g = Grammar::from_regex(r"[0-9]{4}-[0-9]{2}-[0-9]{2}").unwrap();
+        assert!(run(&g, &["2024", "-", "01", "-", "15"]));
+        // A letter is never allowed where a digit is required.
+        let st = GrammarState::new(&g);
+        let ps = pieces_for(&["2", "x"]);
+        let mut mask = vec![false; ps.len()];
+        st.allowed_mask(&ps, &mut mask);
+        assert!(mask[0] && !mask[1]);
+    }
+
+    #[test]
+    fn regex_alternation_and_classes() {
+        // \d+ alternated with a word.
+        let g = Grammar::from_regex(r"(yes|no|\d+)").unwrap();
+        assert!(run(&g, &["yes"]));
+        assert!(run(&g, &["123"]));
+        let g2 = Grammar::from_regex(r"\w+@\w+\.\w+").unwrap();
+        assert!(run(&g2, &["bob", "@", "mail", ".", "com"]));
     }
 
     #[test]

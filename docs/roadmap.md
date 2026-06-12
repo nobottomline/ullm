@@ -63,8 +63,14 @@ level, so invalid output is impossible — on any format, on CPU and GPU.
   a `$ref` resolves to a grammar rule reserved before its target compiles, so a
   tree-of-itself ties the knot instead of looping. Validated on Qwen3-4B with a
   Pydantic-style nested-object schema (`jsonschema` confirms it conforms)
+- ☑ Regex-constrained decoding (`--regex`, `Grammar::from_regex`) — a common
+  regex subset (classes, `\d\w\s`, groups, alternation, `* + ? {n} {n,m} {n,}`)
+  compiled to GBNF, reusing the engine. JSON Schema string `pattern` and `format`
+  (date/date-time/time/email/uuid/ipv4) compile to it. Validated on Qwen3-4B:
+  `--regex` yields a conforming date; a `format:"uuid"` schema yields a matching
+  UUID. (Whitespace in schema grammars is now bounded — an unbounded leading
+  `ws` let a greedy model stall on whitespace.)
 - ☐ Streaming `tool_calls` deltas (tool calls are non-streamed today)
-- ☐ Regex-constrained decoding (a regex → NFA path); string `pattern`/`format`
 - ☐ Schema `additionalProperties` schema, `maxItems`, `minLength`/`maxLength`
 
 ## Phase 2 — Serving & scale
