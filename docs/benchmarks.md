@@ -64,36 +64,36 @@ decode step. The grammar guarantee is effectively free per token.
 
 Prefill runs the whole prompt through one forward pass with a **batched matmul**
 that reads each weight ONCE for all prompt positions, instead of a matvec per
-token. On the GPU the batched kernels (`matmul_bf16_tiled` / `matmul_mlx4` /
-`matmul_q4k` / `matmul_q6k`) write K/V straight into the cache and project only
-the last token's logits; the norm and RoPE steps are also batched across all
-prompt positions (one dispatch instead of one per token). Numerically identical
-to the token-by-token path — verify with `ullm prefill-check <model> --gpu`
-(max |Δlogit| ≤ 6e-5, argmax agrees). `prefill-check --gpu` of a 508-token
-prompt, Apple M-series (both paths timed in the same run):
+token. On the GPU every step is batched across the whole prompt: the matmuls
+(`matmul_bf16_tiled` / `matmul_mlx4` / `matmul_q4k` / `matmul_q6k`, K/V written
+straight into the cache), the norms and RoPE (one dispatch each instead of one
+per token), and the causal attention (`attn_flash_batch` — a single-pass online
+softmax, one simdgroup per query-token×head, in one dispatch). Only the last
+token's logits are projected. Numerically identical to the token-by-token path —
+verify with `ullm prefill-check <model> --gpu` (max |Δlogit| ≤ 2e-4, argmax
+agrees). `prefill-check --gpu` of a 508-token prompt, Apple M-series (both paths
+timed in the same run):
 
 | Model | Quant | token-by-token | batched | speedup |
 |-------|-------|---------------:|--------:|--------:|
-| Qwen3-4B-Instruct (dense) | BF16 | 17.1 s | 2.67 s | **6.40×** |
-| gemma-3-4b (dense) | Q6_K | 6.6 s | 3.74 s | **1.77×** |
-| Qwen2.5-1.5B (dense) | Q4_K_M | 3.45 s | 2.08 s | **1.66×** |
+| Qwen3-4B-Instruct (dense) | BF16 | 17.1 s | 2.01 s | **8.51×** |
+| gemma-3-4b (dense) | Q6_K | 6.96 s | 2.91 s | **2.39×** |
+| Qwen2.5-1.5B (dense) | Q4_K_M | 3.46 s | 1.49 s | **2.32×** |
 
 BF16 wins most: per-token decode is memory-bound, so reading each weight once
 across the batch is a big cut in weight traffic, and the activation reads are
 staged into threadgroup memory (`matmul_bf16_tiled`) so they no longer dominate.
 The k-quants win less — the per-token matvec is already heavily tuned, so the
-batched kernel only pulls ahead once its read-once + dequant-once amortization
+batched matmul only pulls ahead once its read-once + dequant-once amortization
 (sub-block-per-lane, weights dequantized into registers and reused across the
-column tile) beats that; for the small quantized models the prefill floor is the
-per-token causal attention, not the matmul. Short prompts (< 64 tokens) stay on
-the per-token path, where prefill is already a few ms. MoE models also stay
-per-token (experts are routed per token). The CPU path batches too (Llama
-family), via the same read-once `matmul_q`.
+column tile) beats it. Short prompts (< 64 tokens) stay on the per-token path,
+where prefill is already a few ms. MoE models also stay per-token (experts are
+routed per token). The CPU path batches too (Llama family), via the same
+read-once `matmul_q`.
 
-Next lever: a batched / flash-attention kernel (attention is still per query
-token), and a tiled `mul_mm` for the k-quants (simdgroup-matrix 8×8,
-dequantizing a weight tile into threadgroup memory) — the technique llama.cpp
-uses to reach ~1000+ t/s prefill.
+Next lever: a tiled `mul_mm` for the matmul (simdgroup-matrix 8×8, staging both
+the weight tile — dequantized for the k-quants — and the activation tile in
+threadgroup memory) — the technique llama.cpp uses to reach ~1000+ t/s prefill.
 
 ## Correctness
 
