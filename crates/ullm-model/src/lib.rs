@@ -359,6 +359,12 @@ impl LlamaModel {
         self.gpu.is_some()
     }
 
+    /// The model's context window (KV-cache length): the hard cap on prompt +
+    /// generated tokens.
+    pub fn context_len(&self) -> usize {
+        self.config.n_ctx
+    }
+
     /// Step through GPU layer 0 op-by-op, reporting NaN/inf/max (debugging).
     pub fn gpu_forward_debug(&self, token: u32, pos: usize) {
         if let Some(gpu) = &self.gpu {

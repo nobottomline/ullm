@@ -26,6 +26,9 @@ cargo build --release   # binary at ./target/release/ullm
 # Generate from a GGUF file, or a Hugging Face / MLX directory. Drop --gpu for CPU.
 ullm run model.gguf "The capital of France is" --gpu
 
+# Or chat interactively — multi-turn, with conversation memory:
+ullm chat model.gguf --gpu
+
 # Structured output that cannot come out malformed:
 ullm run model.gguf "Extract: John is 30."          --json
 ullm run model.gguf "Review: great blender, 5 stars" --schema grammars/review.schema.json

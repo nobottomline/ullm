@@ -81,6 +81,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Interactive multi-turn chat in the terminal — keeps conversation history,
+    /// applies the chat template. `/reset` clears context, `/exit` quits.
+    Chat {
+        /// Path to a `.gguf` file or HF / MLX model directory.
+        path: PathBuf,
+        /// System prompt to steer the assistant.
+        #[arg(long)]
+        system: Option<String>,
+        /// Sampling temperature (0 = greedy).
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+        /// Nucleus sampling threshold (1.0 = disabled).
+        #[arg(long, default_value_t = 0.95)]
+        top_p: f32,
+        /// Cap on generated tokens per reply.
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+        /// Penalty on recently-used tokens (1.0 = off).
+        #[arg(long, default_value_t = 1.1)]
+        repeat_penalty: f32,
+        /// Run the forward pass on the Metal GPU.
+        #[arg(long)]
+        gpu: bool,
+    },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
         /// Path to a `.gguf` file or HF model directory.
@@ -171,6 +195,28 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Chat {
+            path,
+            system,
+            temperature,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            gpu,
+        } => chat(
+            &path,
+            system.as_deref(),
+            gpu,
+            max_tokens,
+            SampleParams {
+                temperature,
+                top_k: 0,
+                top_p,
+                seed: 0,
+                repeat_penalty,
+                repeat_last_n: 64,
+            },
+        ),
         Command::MetalCheck => metal_check(),
         Command::GpuCheck { path, prompt } => gpu_check(&path, &prompt),
         Command::PrefillCheck { path, prompt } => prefill_check(&path, &prompt),
@@ -670,10 +716,13 @@ fn run(
         |id| {
             gen_ids.push(id);
             let text = tk.decode(&gen_ids);
-            if let Some(delta) = text.get(printed..) {
+            // Hold back a trailing replacement char: it's usually an incomplete
+            // UTF-8 sequence the next token will finish.
+            let stable = text.trim_end_matches('\u{FFFD}');
+            if let Some(delta) = stable.get(printed..) {
                 print!("{delta}");
                 let _ = out.flush();
-                printed = text.len();
+                printed = stable.len();
             }
             true
         },
@@ -690,6 +739,87 @@ fn run(
         n as f64 / gen_s,
         gen_s * 1e3 / n as f64,
     );
+}
+
+/// Interactive multi-turn chat: keep the conversation in memory, wrap it in the
+/// model's chat template each turn, stream the reply.
+fn chat(path: &Path, system: Option<&str>, gpu: bool, max_tokens: usize, params: SampleParams) {
+    use std::io::{BufRead, Write};
+
+    let (tk, mut lm, template) = load_model(path, gpu);
+    let fmt = ullm_tokenizer::chat::ChatFormat::detect(template.as_deref());
+    let backend = if lm.gpu_enabled() { "gpu" } else { "cpu" };
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+
+    // History as (role, content). The system message (if any) is never trimmed.
+    let mut history: Vec<(String, String)> = Vec::new();
+    if let Some(sys) = system {
+        history.push(("system".to_string(), sys.to_string()));
+    }
+
+    println!(
+        "uLLM chat · {name} ({backend}) · context {}",
+        lm.context_len()
+    );
+    println!("Type a message. /reset clears history · /exit quits.");
+
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    loop {
+        print!("\n› ");
+        let _ = out.flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break; // EOF (Ctrl-D)
+        }
+        let msg = line.trim();
+        match msg {
+            "" => continue,
+            "/exit" | "/quit" => break,
+            "/reset" => {
+                history.retain(|(r, _)| r == "system");
+                println!("(context cleared)");
+                continue;
+            }
+            _ => {}
+        }
+        history.push(("user".to_string(), msg.to_string()));
+
+        // Build the prompt, dropping oldest non-system turns until it fits.
+        let prompt_ids = loop {
+            let pairs: Vec<(&str, &str)> = history
+                .iter()
+                .map(|(r, c)| (r.as_str(), c.as_str()))
+                .collect();
+            let ids = tk.encode(&fmt.build_prompt(&pairs), true);
+            if ids.len() + max_tokens < lm.context_len() {
+                break ids;
+            }
+            match history.iter().position(|(r, _)| r != "system") {
+                Some(i) => {
+                    history.remove(i);
+                }
+                None => break ids,
+            }
+        };
+
+        // Stream the reply, decoding incrementally.
+        let mut gen_ids: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        lm.generate_stream(&prompt_ids, max_tokens, tk.eos_id(), &params, None, |id| {
+            gen_ids.push(id);
+            let text = tk.decode(&gen_ids);
+            let stable = text.trim_end_matches('\u{FFFD}');
+            if let Some(delta) = stable.get(printed..) {
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+                printed = stable.len();
+            }
+            true
+        });
+        println!();
+        history.push(("assistant".to_string(), tk.decode(&gen_ids)));
+    }
 }
 
 fn metal_check() {
