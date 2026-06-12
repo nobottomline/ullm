@@ -792,8 +792,39 @@ kernel void rmsnorm(
     for (uint i = tid; i < n; i += nt) y[i] = x[i] * inv * w[i];
 }
 
+// Batched RMSNorm for prefill: one threadgroup per token row (grid = S), each
+// normalizing a contiguous n-vector `x[row*n..]` into `y[row*n..]` with the
+// shared weight — collapses S per-token dispatches into one.
+kernel void rmsnorm_batch(
+    device const float* x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device float*       y [[buffer(2)]],
+    constant uint&      n [[buffer(3)]],
+    constant float&     eps [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt  [[threads_per_threadgroup]])
+{
+    device const float* xr = x + (uint)row * n;
+    device float*       yr = y + (uint)row * n;
+    threadgroup float sh[1024];
+    float local = 0.0f;
+    for (uint i = tid; i < n; i += nt) local += xr[i] * xr[i];
+    sh[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nt / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(sh[0] / (float)n + eps);
+    for (uint i = tid; i < n; i += nt) yr[i] = xr[i] * inv * w[i];
+}
+
 // Per-head RMSNorm: one threadgroup per head, normalizing a head_dim slice in
-// place with a shared weight. Used for Gemma/Qwen3 Q/K-norm.
+// place with a shared weight. Used for Gemma/Qwen3 Q/K-norm. Dispatching
+// `S * n_heads` threadgroups normalizes a whole contiguous [S, n_heads*head_dim]
+// batch in one call (each token row's heads are contiguous), so prefill reuses it
+// as-is across all prompt positions.
 kernel void rmsnorm_heads(
     device float*       x [[buffer(0)]],
     device const float* w [[buffer(1)]],
@@ -836,6 +867,56 @@ kernel void rope_neox(
     float a = v[off + i], b = v[off + i + halfd];
     v[off + i]         = a * c - b * s;
     v[off + i + halfd] = a * s + b * c;
+}
+
+// Batched NeoX RoPE for prefill: one thread per (token row, head, pair). Token
+// `row` sits at byte/float offset `row*row_stride` and rotates at position
+// `base_pos + row`, so all S prompt tokens rotate in a single dispatch.
+kernel void rope_neox_batch(
+    device float*    v [[buffer(0)]],
+    constant uint&   n_heads    [[buffer(1)]],
+    constant uint&   head_dim   [[buffer(2)]],
+    constant uint&   base_pos   [[buffer(3)]],
+    constant float&  theta      [[buffer(4)]],
+    constant uint&   row_stride [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint halfd = head_dim / 2u;
+    uint per_row = n_heads * halfd;
+    uint row = gid / per_row, p = gid % per_row;
+    uint h = p / halfd, i = p % halfd;
+    uint off = row * row_stride + h * head_dim;
+    uint pos = base_pos + row;
+    float freq = pow(theta, -2.0f * (float)i / (float)head_dim);
+    float ang = (float)pos * freq;
+    float c = cos(ang), s = sin(ang);
+    float a = v[off + i], b = v[off + i + halfd];
+    v[off + i]         = a * c - b * s;
+    v[off + i + halfd] = a * s + b * c;
+}
+
+// Batched interleaved RoPE for prefill (see `rope_neox_batch`).
+kernel void rope_norm_batch(
+    device float*    v [[buffer(0)]],
+    constant uint&   n_heads    [[buffer(1)]],
+    constant uint&   head_dim   [[buffer(2)]],
+    constant uint&   base_pos   [[buffer(3)]],
+    constant float&  theta      [[buffer(4)]],
+    constant uint&   row_stride [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint halfd = head_dim / 2u;
+    uint per_row = n_heads * halfd;
+    uint row = gid / per_row, p = gid % per_row;
+    uint h = p / halfd, i = p % halfd;
+    uint off = row * row_stride + h * head_dim + 2u * i;
+    uint pos = base_pos + row;
+    float freq = pow(theta, (float)(2u * i) / (float)head_dim);
+    float ang = (float)pos / freq;
+    float c = cos(ang), s = sin(ang);
+    float a = v[off], b = v[off + 1u];
+    v[off]      = a * c - b * s;
+    v[off + 1u] = a * s + b * c;
 }
 
 // Interleaved (ggml "NORM") RoPE, in place; one thread per rotated pair.

@@ -169,9 +169,12 @@ pub struct GpuForward {
     p_matvec_q4k: ComputePipelineState,
     p_matvec_q6k: ComputePipelineState,
     p_rmsnorm: ComputePipelineState,
+    p_rmsnorm_batch: ComputePipelineState,
     p_rmsnorm_heads: ComputePipelineState,
     p_rope_neox: ComputePipelineState,
     p_rope_norm: ComputePipelineState,
+    p_rope_neox_batch: ComputePipelineState,
+    p_rope_norm_batch: ComputePipelineState,
     p_attn_scores: ComputePipelineState,
     p_attn_softmax: ComputePipelineState,
     p_attn_output: ComputePipelineState,
@@ -313,9 +316,12 @@ impl GpuForward {
             p_matvec_q4k: pso("matvec_q4k_mr")?,
             p_matvec_q6k: pso("matvec_q6k_mr")?,
             p_rmsnorm: pso("rmsnorm")?,
+            p_rmsnorm_batch: pso("rmsnorm_batch")?,
             p_rmsnorm_heads: pso("rmsnorm_heads")?,
             p_rope_neox: pso("rope_neox")?,
             p_rope_norm: pso("rope_norm")?,
+            p_rope_neox_batch: pso("rope_neox_batch")?,
+            p_rope_norm_batch: pso("rope_norm_batch")?,
             p_attn_scores: pso("attn_scores")?,
             p_attn_softmax: pso("attn_softmax")?,
             p_attn_output: pso("attn_output")?,
@@ -754,9 +760,9 @@ impl GpuForward {
         let kv_mul = (p.n_head / p.n_kv_head) as u32;
         let scale = (p.head_dim as f32).sqrt().recip();
         let rope_pso = if p.rope_neox {
-            &self.p_rope_neox
+            &self.p_rope_neox_batch
         } else {
-            &self.p_rope_norm
+            &self.p_rope_norm_batch
         };
         let ffn_pso = if p.geglu {
             &self.p_gelu_mul
@@ -786,47 +792,63 @@ impl GpuForward {
         for (l, lw) in self.layers.iter().enumerate() {
             let kv_layer_off = (l * p.n_ctx * kv_dim * 4) as u64;
 
-            // attention pre-norm, one row per token
-            for t in 0..s {
-                let off = (t * n_embd * 4) as u64;
-                self.rmsnorm(enc, &xs, off, &lw.attn_norm, &xbs, off, n_embd);
-            }
+            // attention pre-norm, all token rows in one dispatch
+            self.rmsnorm_batch(enc, &xs, &lw.attn_norm, &xbs, n_embd, s);
             // batched Q/K/V; K and V land directly in the cache at positions 0..s
             self.matmul(enc, &lw.wq, &xbs, &qs, 0, s);
             self.matmul(enc, &lw.wk, &xbs, &self.key_cache, kv_layer_off, s);
             self.matmul(enc, &lw.wv, &xbs, &self.val_cache, kv_layer_off, s);
 
-            // per-token bias / qk-norm / rope on Q and the cached K
-            for t in 0..s {
-                let q_off = (t * q_dim * 4) as u64;
-                let kv_off = ((l * p.n_ctx + t) * kv_dim * 4) as u64;
-                if let Some(b) = &lw.q_bias {
-                    self.add_off(enc, &qs, q_off, b, q_dim);
-                }
-                if let Some(b) = &lw.k_bias {
-                    self.add_off(enc, &self.key_cache, kv_off, b, kv_dim);
-                }
-                if let Some(b) = &lw.v_bias {
-                    self.add_off(enc, &self.val_cache, kv_off, b, kv_dim);
-                }
-                if p.qk_norm {
-                    if let Some(qn) = &lw.q_norm {
-                        self.rmsnorm_heads(enc, &qs, q_off, qn, p.n_head as u64);
+            // Q/K/V biases (Qwen2) — added to every token row; rare, kept per-token
+            if lw.q_bias.is_some() || lw.k_bias.is_some() || lw.v_bias.is_some() {
+                for t in 0..s {
+                    let q_off = (t * q_dim * 4) as u64;
+                    let kv_off = ((l * p.n_ctx + t) * kv_dim * 4) as u64;
+                    if let Some(b) = &lw.q_bias {
+                        self.add_off(enc, &qs, q_off, b, q_dim);
                     }
-                    if let Some(kn) = &lw.k_norm {
-                        self.rmsnorm_heads(enc, &self.key_cache, kv_off, kn, p.n_kv_head as u64);
+                    if let Some(b) = &lw.k_bias {
+                        self.add_off(enc, &self.key_cache, kv_off, b, kv_dim);
+                    }
+                    if let Some(b) = &lw.v_bias {
+                        self.add_off(enc, &self.val_cache, kv_off, b, kv_dim);
                     }
                 }
-                self.rope(enc, rope_pso, &qs, q_off, p.n_head as u32, t as u32);
-                self.rope(
-                    enc,
-                    rope_pso,
-                    &self.key_cache,
-                    kv_off,
-                    p.n_kv_head as u32,
-                    t as u32,
-                );
             }
+            // qk-norm + RoPE, batched across all token rows (one dispatch each)
+            if p.qk_norm {
+                if let Some(qn) = &lw.q_norm {
+                    self.rmsnorm_heads_batch(enc, &qs, 0, qn, p.n_head as u64, s as u64);
+                }
+                if let Some(kn) = &lw.k_norm {
+                    self.rmsnorm_heads_batch(
+                        enc,
+                        &self.key_cache,
+                        kv_layer_off,
+                        kn,
+                        p.n_kv_head as u64,
+                        s as u64,
+                    );
+                }
+            }
+            self.rope_batch(
+                enc,
+                rope_pso,
+                &qs,
+                0,
+                p.n_head as u32,
+                q_dim as u32,
+                s as u32,
+            );
+            self.rope_batch(
+                enc,
+                rope_pso,
+                &self.key_cache,
+                kv_layer_off,
+                p.n_kv_head as u32,
+                kv_dim as u32,
+                s as u32,
+            );
 
             // per-token causal attention into `attns`
             for t in 0..s {
@@ -855,19 +877,13 @@ impl GpuForward {
             self.matmul(enc, &lw.wo, &attns, &xbs, 0, s);
             if p.sandwich_norm {
                 if let Some(w) = &lw.post_attn_norm {
-                    for t in 0..s {
-                        let off = (t * n_embd * 4) as u64;
-                        self.rmsnorm(enc, &xbs, off, w, &xbs, off, n_embd);
-                    }
+                    self.rmsnorm_batch(enc, &xbs, w, &xbs, n_embd, s);
                 }
             }
             self.add(enc, &xs, &xbs, s * n_embd);
 
             // dense feed-forward (MoE is excluded by `supports_batched_prefill`)
-            for t in 0..s {
-                let off = (t * n_embd * 4) as u64;
-                self.rmsnorm(enc, &xs, off, &lw.ffn_norm, &xbs, off, n_embd);
-            }
+            self.rmsnorm_batch(enc, &xs, &lw.ffn_norm, &xbs, n_embd, s);
             self.matmul(enc, &lw.w_gate, &xbs, &gates, 0, s);
             self.matmul(enc, &lw.w_up, &xbs, &ups, 0, s);
             // batched GLU activation, elementwise over s*n_ff
@@ -881,10 +897,7 @@ impl GpuForward {
             self.matmul(enc, &lw.w_down, &hiddens, &xb2s, 0, s);
             if p.sandwich_norm {
                 if let Some(w) = &lw.post_ffn_norm {
-                    for t in 0..s {
-                        let off = (t * n_embd * 4) as u64;
-                        self.rmsnorm(enc, &xb2s, off, w, &xb2s, off, n_embd);
-                    }
+                    self.rmsnorm_batch(enc, &xb2s, w, &xb2s, n_embd, s);
                 }
             }
             self.add(enc, &xs, &xb2s, s * n_embd);
@@ -1037,6 +1050,78 @@ impl GpuForward {
         enc.set_bytes(4, 4, (&self.p.rope_theta as *const f32).cast());
         let pairs = (n_heads * hd / 2) as u64;
         dispatch_1d(enc, pso, pairs);
+    }
+
+    /// Batched RMSNorm over `rows` contiguous n-vectors (one threadgroup each):
+    /// `y[r*n..] = norm(x[r*n..]) * w`. Both buffers bound at offset 0.
+    fn rmsnorm_batch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        w: &Buffer,
+        y: &Buffer,
+        n: usize,
+        rows: usize,
+    ) {
+        enc.set_compute_pipeline_state(&self.p_rmsnorm_batch);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(w), 0);
+        enc.set_buffer(2, Some(y), 0);
+        let n_u = n as u32;
+        enc.set_bytes(3, 4, (&n_u as *const u32).cast());
+        enc.set_bytes(4, 4, (&self.p.eps as *const f32).cast());
+        enc.dispatch_thread_groups(
+            MTLSize::new(rows as u64, 1, 1),
+            MTLSize::new(REDUCE_NT, 1, 1),
+        );
+    }
+
+    /// Batched per-head RMSNorm (Q/K-norm) over all `rows` token rows at once:
+    /// `rows * n_heads` threadgroups against the contiguous `[rows, n_heads*hd]`.
+    fn rmsnorm_heads_batch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        x_off: u64,
+        w: &Buffer,
+        n_heads: u64,
+        rows: u64,
+    ) {
+        enc.set_compute_pipeline_state(&self.p_rmsnorm_heads);
+        enc.set_buffer(0, Some(x), x_off);
+        enc.set_buffer(1, Some(w), 0);
+        let hd = self.p.head_dim as u32;
+        enc.set_bytes(2, 4, (&hd as *const u32).cast());
+        enc.set_bytes(3, 4, (&self.p.eps as *const f32).cast());
+        enc.dispatch_thread_groups(
+            MTLSize::new(n_heads * rows, 1, 1),
+            MTLSize::new(REDUCE_NT, 1, 1),
+        );
+    }
+
+    /// Batched RoPE over all `rows` token rows (positions `0..rows`), `row_stride`
+    /// floats between consecutive rows. `pso` is the neox/norm batch kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_batch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        pso: &ComputePipelineState,
+        v: &Buffer,
+        v_off: u64,
+        n_heads: u32,
+        row_stride: u32,
+        rows: u32,
+    ) {
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(v), v_off);
+        let hd = self.p.head_dim as u32;
+        let base: u32 = 0; // prefill starts at sequence position 0
+        enc.set_bytes(1, 4, (&n_heads as *const u32).cast());
+        enc.set_bytes(2, 4, (&hd as *const u32).cast());
+        enc.set_bytes(3, 4, (&base as *const u32).cast());
+        enc.set_bytes(4, 4, (&self.p.rope_theta as *const f32).cast());
+        enc.set_bytes(5, 4, (&row_stride as *const u32).cast());
+        dispatch_1d(enc, pso, (rows * n_heads * (hd / 2)) as u64);
     }
 
     #[allow(clippy::too_many_arguments)]
