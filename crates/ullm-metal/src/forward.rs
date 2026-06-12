@@ -161,6 +161,7 @@ struct GpuLayer {
 /// A model resident on the GPU, ready to decode tokens.
 pub struct GpuForward {
     queue: CommandQueue,
+    device: Device,
     // pipelines
     p_matvec_f32: ComputePipelineState,
     p_matvec_f16: ComputePipelineState,
@@ -178,6 +179,8 @@ pub struct GpuForward {
     p_gelu_mul: ComputePipelineState,
     p_add: ComputePipelineState,
     p_matvec_mlx4: ComputePipelineState,
+    p_matmul_bf16: ComputePipelineState,
+    p_matmul_mlx4: ComputePipelineState,
     p_moe_topk: ComputePipelineState,
     p_moe_gate_up_all: ComputePipelineState,
     p_moe_down_all: ComputePipelineState,
@@ -318,6 +321,8 @@ impl GpuForward {
             p_gelu_mul: pso("gelu_mul")?,
             p_add: pso("add_inplace")?,
             p_matvec_mlx4: pso("matvec_mlx4")?,
+            p_matmul_bf16: pso("matmul_bf16")?,
+            p_matmul_mlx4: pso("matmul_mlx4")?,
             p_moe_topk: pso("moe_topk")?,
             p_moe_gate_up_all: pso("moe_gate_up_all")?,
             p_moe_down_all: pso("moe_down_all")?,
@@ -343,6 +348,7 @@ impl GpuForward {
             moe_hidden: alloc((p.n_experts_used * p.moe_inter).max(1)),
             moe_down: alloc((p.n_experts_used * p.n_embd).max(1)),
             queue,
+            device,
             p,
         })
     }
@@ -434,9 +440,9 @@ impl GpuForward {
             } else {
                 0
             };
-            self.attn_scores(enc, kv_layer_off, kv_mul, scale, seqlen, attn_start);
+            self.attn_scores(enc, &self.q, 0, kv_layer_off, kv_mul, scale, seqlen, attn_start);
             self.attn_softmax(enc, seqlen, attn_start);
-            self.attn_output(enc, kv_layer_off, kv_mul, seqlen, attn_start);
+            self.attn_output(enc, &self.attn, 0, kv_layer_off, kv_mul, seqlen, attn_start);
 
             // output projection into xb (n_embd), optional post-norm, residual
             self.matvec(enc, &lw.wo, &self.attn, &self.xb, 0);
@@ -574,7 +580,7 @@ impl GpuForward {
             )
         });
         check(&self.key_cache, kv_pos_off, kv_dim, "rope_k");
-        run(&|e| self.attn_scores(e, 0, kv_mul, scale, seqlen, 0));
+        run(&|e| self.attn_scores(e, &self.q, 0, 0, kv_mul, scale, seqlen, 0));
         check(
             &self.scores,
             0,
@@ -582,7 +588,7 @@ impl GpuForward {
             "attn_scores",
         );
         run(&|e| self.attn_softmax(e, seqlen, 0));
-        run(&|e| self.attn_output(e, 0, kv_mul, seqlen, 0));
+        run(&|e| self.attn_output(e, &self.attn, 0, 0, kv_mul, seqlen, 0));
         check(&self.attn, 0, q_dim, "attn_out");
         run(&|e| self.matvec(e, &lw.wo, &self.attn, &self.xb, 0));
         check(&self.xb, 0, p.n_embd, "wo");
@@ -643,6 +649,228 @@ impl GpuForward {
         };
         let groups = (w.out as u64).div_ceil(sgs * nr0);
         enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
+    /// Batched matmul against a resident weight: `xs` token-major `[s, in]` ->
+    /// `ys[y_off..]` `[s, out]`, reading each weight ONCE for all `s` columns.
+    /// Returns false for a dtype with no batched kernel (only BF16 and MLX 4-bit
+    /// are batched today); the caller then falls back to per-token matvecs.
+    fn matmul(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        w: &WBuf,
+        xs: &Buffer,
+        ys: &Buffer,
+        y_off: u64,
+        s: usize,
+    ) -> bool {
+        let (in_dim, out_dim, su) = (w.cols as u32, w.out as u32, s as u32);
+        let nsg = 8u64; // simdgroups per threadgroup, one output row each
+        let t_cols = 4u64; // tokens per simdgroup, must match T in the kernel
+        let grid = MTLSize::new((w.out as u64).div_ceil(nsg), (s as u64).div_ceil(t_cols), 1);
+        let tg = MTLSize::new(32 * nsg, 1, 1);
+        if let Some(m) = &w.mlx {
+            enc.set_compute_pipeline_state(&self.p_matmul_mlx4);
+            enc.set_buffer(0, Some(&w.buf), 0);
+            enc.set_buffer(1, Some(xs), 0);
+            enc.set_buffer(2, Some(ys), y_off);
+            enc.set_buffer(3, Some(&m.scales), 0);
+            enc.set_buffer(4, Some(&m.biases), 0);
+            enc.set_bytes(5, 4, (&in_dim as *const u32).cast());
+            enc.set_bytes(6, 4, (&out_dim as *const u32).cast());
+            enc.set_bytes(7, 4, (&m.group as *const u32).cast());
+            enc.set_bytes(8, 4, (&su as *const u32).cast());
+            enc.dispatch_thread_groups(grid, tg);
+            return true;
+        }
+        if w.dtype == DType::BF16 {
+            enc.set_compute_pipeline_state(&self.p_matmul_bf16);
+            enc.set_buffer(0, Some(&w.buf), 0);
+            enc.set_buffer(1, Some(xs), 0);
+            enc.set_buffer(2, Some(ys), y_off);
+            enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
+            enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
+            enc.set_bytes(5, 4, (&su as *const u32).cast());
+            enc.dispatch_thread_groups(grid, tg);
+            return true;
+        }
+        false
+    }
+
+    /// Whether `forward_batch` can run this model: every attention/FFN projection
+    /// has a batched matmul kernel (BF16 or MLX 4-bit) and the FFN is dense. The
+    /// output projection is excluded — prefill matvecs only its last row.
+    pub fn supports_batched_prefill(&self) -> bool {
+        let ok = |w: &WBuf| w.mlx.is_some() || w.dtype == DType::BF16;
+        self.layers.iter().all(|l| {
+            l.moe_gate.is_none()
+                && ok(&l.wq)
+                && ok(&l.wk)
+                && ok(&l.wv)
+                && ok(&l.wo)
+                && ok(&l.w_gate)
+                && ok(&l.w_up)
+                && ok(&l.w_down)
+        })
+    }
+
+    /// Batched prompt prefill: run all `s` tokens (positions `0..s`) through one
+    /// forward pass, reading each weight ONCE via batched matmul, filling the KV
+    /// cache for positions `0..s`, and returning the LAST token's logits.
+    /// Numerically equivalent to calling `forward` token-by-token. `embeds` is
+    /// the scaled input embeddings, token-major `[s, n_embd]`. Requires
+    /// `supports_batched_prefill`.
+    pub fn forward_batch(&self, embeds: &[f32], s: usize) -> Result<Vec<f32>> {
+        let p = self.p;
+        let n_embd = p.n_embd;
+        let kv_dim = p.n_kv_head * p.head_dim;
+        let q_dim = p.n_head * p.head_dim;
+        let kv_mul = (p.n_head / p.n_kv_head) as u32;
+        let scale = (p.head_dim as f32).sqrt().recip();
+        let rope_pso = if p.rope_neox {
+            &self.p_rope_neox
+        } else {
+            &self.p_rope_norm
+        };
+        let ffn_pso = if p.geglu {
+            &self.p_gelu_mul
+        } else {
+            &self.p_silu_mul
+        };
+
+        let alloc = |n: usize| self.device.new_buffer((n * 4) as u64, SHARED);
+        let xs = alloc(s * n_embd);
+        let xbs = alloc(s * n_embd);
+        let xb2s = alloc(s * n_embd);
+        let qs = alloc(s * q_dim);
+        let attns = alloc(s * q_dim);
+        let nff = p.n_ff.max(1);
+        let gates = alloc(s * nff);
+        let ups = alloc(s * nff);
+        let hiddens = alloc(s * nff);
+
+        // SAFETY: shared storage; `embeds` has exactly `s * n_embd` f32.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                embeds.as_ptr(),
+                xs.contents().cast::<f32>(),
+                s * n_embd,
+            );
+        }
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+
+        for (l, lw) in self.layers.iter().enumerate() {
+            let kv_layer_off = (l * p.n_ctx * kv_dim * 4) as u64;
+
+            // attention pre-norm, one row per token
+            for t in 0..s {
+                let off = (t * n_embd * 4) as u64;
+                self.rmsnorm(enc, &xs, off, &lw.attn_norm, &xbs, off, n_embd);
+            }
+            // batched Q/K/V; K and V land directly in the cache at positions 0..s
+            self.matmul(enc, &lw.wq, &xbs, &qs, 0, s);
+            self.matmul(enc, &lw.wk, &xbs, &self.key_cache, kv_layer_off, s);
+            self.matmul(enc, &lw.wv, &xbs, &self.val_cache, kv_layer_off, s);
+
+            // per-token bias / qk-norm / rope on Q and the cached K
+            for t in 0..s {
+                let q_off = (t * q_dim * 4) as u64;
+                let kv_off = ((l * p.n_ctx + t) * kv_dim * 4) as u64;
+                if let Some(b) = &lw.q_bias {
+                    self.add_off(enc, &qs, q_off, b, q_dim);
+                }
+                if let Some(b) = &lw.k_bias {
+                    self.add_off(enc, &self.key_cache, kv_off, b, kv_dim);
+                }
+                if let Some(b) = &lw.v_bias {
+                    self.add_off(enc, &self.val_cache, kv_off, b, kv_dim);
+                }
+                if p.qk_norm {
+                    if let Some(qn) = &lw.q_norm {
+                        self.rmsnorm_heads(enc, &qs, q_off, qn, p.n_head as u64);
+                    }
+                    if let Some(kn) = &lw.k_norm {
+                        self.rmsnorm_heads(enc, &self.key_cache, kv_off, kn, p.n_kv_head as u64);
+                    }
+                }
+                self.rope(enc, rope_pso, &qs, q_off, p.n_head as u32, t as u32);
+                self.rope(enc, rope_pso, &self.key_cache, kv_off, p.n_kv_head as u32, t as u32);
+            }
+
+            // per-token causal attention into `attns`
+            for t in 0..s {
+                let seqlen = (t + 1) as u32;
+                let q_off = (t * q_dim * 4) as u64;
+                let attn_start = if p.sliding_window > 0 && l % 6 != 5 && t + 1 > p.sliding_window {
+                    (t + 1 - p.sliding_window) as u32
+                } else {
+                    0
+                };
+                self.attn_scores(enc, &qs, q_off, kv_layer_off, kv_mul, scale, seqlen, attn_start);
+                self.attn_softmax(enc, seqlen, attn_start);
+                self.attn_output(enc, &attns, q_off, kv_layer_off, kv_mul, seqlen, attn_start);
+            }
+
+            // output projection + optional post-norm + residual
+            self.matmul(enc, &lw.wo, &attns, &xbs, 0, s);
+            if p.sandwich_norm {
+                if let Some(w) = &lw.post_attn_norm {
+                    for t in 0..s {
+                        let off = (t * n_embd * 4) as u64;
+                        self.rmsnorm(enc, &xbs, off, w, &xbs, off, n_embd);
+                    }
+                }
+            }
+            self.add(enc, &xs, &xbs, s * n_embd);
+
+            // dense feed-forward (MoE is excluded by `supports_batched_prefill`)
+            for t in 0..s {
+                let off = (t * n_embd * 4) as u64;
+                self.rmsnorm(enc, &xs, off, &lw.ffn_norm, &xbs, off, n_embd);
+            }
+            self.matmul(enc, &lw.w_gate, &xbs, &gates, 0, s);
+            self.matmul(enc, &lw.w_up, &xbs, &ups, 0, s);
+            // batched GLU activation, elementwise over s*n_ff
+            enc.set_compute_pipeline_state(ffn_pso);
+            enc.set_buffer(0, Some(&gates), 0);
+            enc.set_buffer(1, Some(&ups), 0);
+            enc.set_buffer(2, Some(&hiddens), 0);
+            let n_glu = (s * p.n_ff) as u32;
+            enc.set_bytes(3, 4, (&n_glu as *const u32).cast());
+            dispatch_1d(enc, ffn_pso, (s * p.n_ff) as u64);
+            self.matmul(enc, &lw.w_down, &hiddens, &xb2s, 0, s);
+            if p.sandwich_norm {
+                if let Some(w) = &lw.post_ffn_norm {
+                    for t in 0..s {
+                        let off = (t * n_embd * 4) as u64;
+                        self.rmsnorm(enc, &xb2s, off, w, &xb2s, off, n_embd);
+                    }
+                }
+            }
+            self.add(enc, &xs, &xb2s, s * n_embd);
+        }
+
+        // final norm + output projection — only the last token's logits matter
+        let last = ((s - 1) * n_embd * 4) as u64;
+        self.rmsnorm(enc, &xs, last, &self.final_norm, &self.xb, 0, n_embd);
+        self.matvec(enc, &self.output, &self.xb, &self.logits, 0);
+
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut out = vec![0.0f32; p.vocab];
+        // SAFETY: shared storage; `logits` holds `vocab` f32 after completion.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.logits.contents().cast::<f32>(),
+                out.as_mut_ptr(),
+                p.vocab,
+            );
+        }
+        Ok(out)
     }
 
     /// All-experts fused gate+up+activation: one 2D dispatch over (rows x k)
@@ -773,9 +1001,12 @@ impl GpuForward {
         dispatch_1d(enc, pso, pairs);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attn_scores(
         &self,
         enc: &ComputeCommandEncoderRef,
+        q: &Buffer,
+        q_off: u64,
         kv_layer_off: u64,
         kv_mul: u32,
         scale: f32,
@@ -783,7 +1014,7 @@ impl GpuForward {
         start: u32,
     ) {
         enc.set_compute_pipeline_state(&self.p_attn_scores);
-        enc.set_buffer(0, Some(&self.q), 0);
+        enc.set_buffer(0, Some(q), q_off);
         enc.set_buffer(1, Some(&self.key_cache), kv_layer_off);
         enc.set_buffer(2, Some(&self.scores), 0);
         let hd = self.p.head_dim as u32;
@@ -812,9 +1043,12 @@ impl GpuForward {
         enc.dispatch_thread_groups(MTLSize::new(nh, 1, 1), MTLSize::new(REDUCE_NT, 1, 1));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attn_output(
         &self,
         enc: &ComputeCommandEncoderRef,
+        attn: &Buffer,
+        attn_off: u64,
         kv_layer_off: u64,
         kv_mul: u32,
         seqlen: u32,
@@ -823,7 +1057,7 @@ impl GpuForward {
         enc.set_compute_pipeline_state(&self.p_attn_output);
         enc.set_buffer(0, Some(&self.scores), 0);
         enc.set_buffer(1, Some(&self.val_cache), kv_layer_off);
-        enc.set_buffer(2, Some(&self.attn), 0);
+        enc.set_buffer(2, Some(attn), attn_off);
         let hd = self.p.head_dim as u32;
         let kv_dim = (self.p.n_kv_head * self.p.head_dim) as u32;
         let stride = self.p.n_ctx as u32;

@@ -130,13 +130,16 @@ enum Command {
         #[arg(default_value = "The capital of France is")]
         prompt: String,
     },
-    /// Validate batched prefill against the token-by-token CPU forward.
+    /// Validate batched prefill against the token-by-token forward.
     PrefillCheck {
         /// Path to a `.gguf` file or HF model directory.
         path: PathBuf,
         /// The prompt to run through both prefill paths.
         #[arg(default_value = "The capital of France is Paris. The capital of Germany is")]
         prompt: String,
+        /// Validate the GPU batched prefill instead of the CPU one.
+        #[arg(long)]
+        gpu: bool,
     },
     /// Benchmark grammar masking (naive O(vocab) vs the token-trie fast path).
     GrammarBench {
@@ -220,7 +223,7 @@ fn main() {
         ),
         Command::MetalCheck => metal_check(),
         Command::GpuCheck { path, prompt } => gpu_check(&path, &prompt),
-        Command::PrefillCheck { path, prompt } => prefill_check(&path, &prompt),
+        Command::PrefillCheck { path, prompt, gpu } => prefill_check(&path, &prompt, gpu),
         Command::GrammarBench { path } => grammar_bench(&path),
     }
 }
@@ -318,12 +321,19 @@ fn grammar_bench(path: &Path) {
 
 /// Run a prompt through the batched prefill and the token-by-token CPU forward
 /// and confirm the final-position logits match (max abs diff + argmax agree).
-fn prefill_check(path: &Path, prompt: &str) {
-    let (tk, mut lm, _) = load_model(path, false);
+fn prefill_check(path: &Path, prompt: &str, gpu: bool) {
+    let (tk, mut lm, _) = load_model(path, gpu);
     let ids = tk.encode(prompt, true);
-    let r = lm.prefill_check(&ids);
+    let r = if gpu {
+        match lm.gpu_prefill_check(&ids) {
+            Some(r) => r,
+            None => die("gpu prefill-check: model has no batched-prefill kernel (needs BF16 or MLX 4-bit, dense FFN)"),
+        }
+    } else {
+        lm.prefill_check(&ids)
+    };
 
-    println!("prefill-check: {path:?}");
+    println!("prefill-check ({}): {path:?}", if gpu { "gpu" } else { "cpu" });
     println!("  tokens:        {}", ids.len());
     println!(
         "  batch argmax:  {}  ({:?})",

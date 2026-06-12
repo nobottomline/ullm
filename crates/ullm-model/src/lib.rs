@@ -881,21 +881,40 @@ impl LlamaModel {
             params.seed
         };
 
-        // Prefill: on CPU for the Llama family, run the whole prompt through one
-        // batched forward (each weight read once) instead of token-by-token. The
-        // GPU path and Gemma keep their per-token routes.
-        let batched = !self.gpu_enabled() && self.config.arch != Arch::Gemma3;
-        if batched && !prompt.is_empty() {
+        // Prefill: read each weight once for the whole prompt instead of
+        // token-by-token. The GPU uses the batched Metal matmul (BF16 / MLX
+        // dense models); the CPU Llama family uses the batched forward. Gemma and
+        // quantized / MoE GPU models fall back to the per-token route.
+        if !prompt.is_empty() {
             let take = prompt.len().min(self.config.n_ctx);
-            logits = self.forward_batch(&prompt[..take], 0);
-            pos = take;
-        } else {
-            for &tok in prompt {
-                if pos >= self.config.n_ctx {
-                    return;
+            let did_batch = if let Some(gpu) = self.gpu.as_ref() {
+                if gpu.supports_batched_prefill() {
+                    let n = self.config.n_embd;
+                    let mut embeds = Vec::with_capacity(take * n);
+                    for &tok in &prompt[..take] {
+                        embeds.extend_from_slice(&self.embed(tok));
+                    }
+                    logits = gpu.forward_batch(&embeds, take).expect("gpu forward_batch");
+                    pos = take;
+                    true
+                } else {
+                    false
                 }
-                logits = self.forward(tok, pos);
-                pos += 1;
+            } else if self.config.arch != Arch::Gemma3 {
+                logits = self.forward_batch(&prompt[..take], 0);
+                pos = take;
+                true
+            } else {
+                false
+            };
+            if !did_batch {
+                for &tok in &prompt[..take] {
+                    if pos >= self.config.n_ctx {
+                        return;
+                    }
+                    logits = self.forward(tok, pos);
+                    pos += 1;
+                }
             }
         }
 
@@ -978,6 +997,61 @@ impl LlamaModel {
             batch_ms,
             seq_ms,
         }
+    }
+
+    /// GPU analogue of [`prefill_check`](Self::prefill_check): compare the GPU
+    /// batched prefill against the GPU per-token forward at the final position,
+    /// and time both. Returns `None` if the GPU path is inactive or the model
+    /// has no batched-prefill kernel (e.g. a quantized GGUF or an MoE model).
+    pub fn gpu_prefill_check(&self, prompt: &[u32]) -> Option<PrefillCheck> {
+        let gpu = self.gpu.as_ref()?;
+        if !gpu.supports_batched_prefill() || prompt.is_empty() {
+            return None;
+        }
+        let n = self.config.n_embd;
+        let mut embeds = Vec::with_capacity(prompt.len() * n);
+        for &tok in prompt {
+            embeds.extend_from_slice(&self.embed(tok));
+        }
+
+        let t0 = std::time::Instant::now();
+        let lb = gpu
+            .forward_batch(&embeds, prompt.len())
+            .expect("gpu forward_batch");
+        let batch_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // Per-token forward refills the same KV cache positions deterministically,
+        // so its final-position logits are the reference for the batched pass.
+        let t1 = std::time::Instant::now();
+        let mut ls = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            let x = self.embed(tok);
+            ls = gpu.forward(&x, pos).expect("gpu forward");
+        }
+        let seq_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        let max_diff = lb
+            .iter()
+            .zip(&ls)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv { (i, x) } else { (bi, bv) }
+                })
+                .0 as u32
+        };
+        let (batch_argmax, seq_argmax) = (argmax(&lb), argmax(&ls));
+        Some(PrefillCheck {
+            max_diff,
+            agree: batch_argmax == seq_argmax,
+            batch_argmax,
+            seq_argmax,
+            batch_ms,
+            seq_ms,
+        })
     }
 }
 
