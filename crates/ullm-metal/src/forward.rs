@@ -679,7 +679,9 @@ impl GpuForward {
     ) -> bool {
         let (in_dim, out_dim, su) = (w.cols as u32, w.out as u32, s as u32);
         let nsg = 8u64; // simdgroups per threadgroup, one output row each
-        let t_cols = 4u64; // tokens per simdgroup, must match T in the kernel
+        // Token columns per simdgroup — MUST match `T` in the chosen kernel. Q6_K
+        // uses 4 (acc[8]+wv[16] would spill registers); the rest use 8.
+        let t_cols: u64 = if w.dtype == DType::Q6K { 4 } else { 8 };
         let grid = MTLSize::new((w.out as u64).div_ceil(nsg), (s as u64).div_ceil(t_cols), 1);
         let tg = MTLSize::new(32 * nsg, 1, 1);
         if let Some(m) = &w.mlx {

@@ -490,12 +490,12 @@ kernel void matmul_bf16(
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort nsg   [[simdgroups_per_threadgroup]])
 {
-    const uint T = 4;
+    const uint T = 8;
     uint o = (uint)tgpig.x * nsg + sgitg;
     uint col0 = (uint)tgpig.y * T;
     if (o >= out_dim) return;
     device const ushort* wrow = w + (uint)o * in_dim;
-    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    float acc[T]; for (uint t = 0; t < T; ++t) acc[t] = 0.f;
     for (uint i = tiisg; i < in_dim; i += 32u) {
         float wv = as_type<float>((uint)wrow[i] << 16);
         for (uint t = 0; t < T; ++t) {
@@ -529,7 +529,7 @@ kernel void matmul_mlx4(
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort nsg   [[simdgroups_per_threadgroup]])
 {
-    const uint T = 4;
+    const uint T = 8;
     uint o = (uint)tgpig.x * nsg + sgitg;
     uint col0 = (uint)tgpig.y * T;
     if (o >= out_dim) return;
@@ -539,7 +539,7 @@ kernel void matmul_mlx4(
     device const uint*  wrow = w + (uint)o * words;
     device const float* srow = scales + (uint)o * groups;
     device const float* brow = biases + (uint)o * groups;
-    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    float acc[T]; for (uint t = 0; t < T; ++t) acc[t] = 0.f;
     for (uint wi = tiisg; wi < words; wi += 32u) {
         uint word = wrow[wi];
         uint g = wi / wpg;
@@ -578,14 +578,14 @@ kernel void matmul_q4k(
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort nsg   [[simdgroups_per_threadgroup]])
 {
-    const uint T = 4;
+    const uint T = 8;
     uint o = (uint)tgpig.x * nsg + sgitg;
     uint col0 = (uint)tgpig.y * T;
     if (o >= out_dim) return;
     uint blocks = in_dim / 256u;
     uint subs = blocks * 8u; // 32-weight sub-blocks in this row
     device const uchar* row = w + (uint)o * blocks * 144u;
-    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    float acc[T]; for (uint t = 0; t < T; ++t) acc[t] = 0.f;
     for (uint sb = tiisg; sb < subs; sb += 32u) {
         uint b = sb / 8u, si = sb % 8u;
         device const uchar* blk = row + b * 144u;
@@ -642,14 +642,14 @@ kernel void matmul_q6k(
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort nsg   [[simdgroups_per_threadgroup]])
 {
-    const uint T = 4;
+    const uint T = 4; // q6k stays at 4 — acc[8]+wv[16] spills registers and regresses
     uint o = (uint)tgpig.x * nsg + sgitg;
     uint col0 = (uint)tgpig.y * T;
     if (o >= out_dim) return;
     uint blocks = in_dim / 256u;
     uint subs = blocks * 16u; // 16-weight sub-blocks in this row
     device const uchar* row = w + (uint)o * blocks * 210u;
-    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    float acc[T]; for (uint t = 0; t < T; ++t) acc[t] = 0.f;
     for (uint sb = tiisg; sb < subs; sb += 32u) {
         uint b = sb / 16u, k = sb % 16u;       // block, scale index 0..15
         device const uchar* blk = row + b * 210u;
