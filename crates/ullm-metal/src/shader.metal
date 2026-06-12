@@ -510,6 +510,56 @@ kernel void matmul_bf16(
     }
 }
 
+// Batched MLX 4-bit matmul (prompt prefill): packed-u32 weights dequantized in
+// the kernel (q*scale+bias, 8 nibbles/word LSB-first), W[out,in] x X[S,in] ->
+// Y[S,out]. One simdgroup per output row computes a tile of T columns, reading
+// and dequantizing W[o] ONCE per word and reusing it across the tile.
+kernel void matmul_mlx4(
+    device const uint*  w          [[buffer(0)]],
+    device const float* x          [[buffer(1)]],
+    device float*       y          [[buffer(2)]],
+    device const float* scales     [[buffer(3)]],
+    device const float* biases     [[buffer(4)]],
+    constant uint&      in_dim     [[buffer(5)]],
+    constant uint&      out_dim    [[buffer(6)]],
+    constant uint&      group_size [[buffer(7)]],
+    constant uint&      n_cols     [[buffer(8)]],
+    uint2  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint T = 4;
+    uint o = (uint)tgpig.x * nsg + sgitg;
+    uint col0 = (uint)tgpig.y * T;
+    if (o >= out_dim) return;
+    uint words = in_dim / 8u;
+    uint wpg = group_size / 8u;
+    uint groups = in_dim / group_size;
+    device const uint*  wrow = w + (uint)o * words;
+    device const float* srow = scales + (uint)o * groups;
+    device const float* brow = biases + (uint)o * groups;
+    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    for (uint wi = tiisg; wi < words; wi += 32u) {
+        uint word = wrow[wi];
+        uint g = wi / wpg;
+        float sc = srow[g], bi = brow[g];
+        for (uint n = 0; n < 8u; ++n) {
+            float wv = (float)((word >> (n * 4u)) & 0xFu) * sc + bi;
+            uint i = wi * 8u + n;
+            for (uint t = 0; t < T; ++t) {
+                uint s = col0 + t;
+                if (s < n_cols) acc[t] += wv * x[s * in_dim + i];
+            }
+        }
+    }
+    for (uint t = 0; t < T; ++t) {
+        float r = simd_sum(acc[t]);
+        uint s = col0 + t;
+        if (tiisg == 0 && s < n_cols) y[s * out_dim + o] = r;
+    }
+}
+
 // Multi-row F16 matvec (same layout, half -> float).
 kernel void matvec_f16_mr(
     device const half*  src0    [[buffer(0)]],
