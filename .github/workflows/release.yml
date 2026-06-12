@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin ullm
+
+      - name: Package
+        run: |
+          NAME="ullm-${GITHUB_REF_NAME}-aarch64-apple-darwin"
+          mkdir -p "$NAME"
+          cp target/release/ullm LICENSE NOTICE README.md "$NAME/"
+          tar -czf "${NAME}.tar.gz" "$NAME"
+          shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ullm-*-aarch64-apple-darwin.tar.gz
+            ullm-*-aarch64-apple-darwin.tar.gz.sha256

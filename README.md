@@ -18,11 +18,25 @@ Apple-Silicon-first, embeddable.
 > Metal GPU — including a 30B mixture-of-experts — and the guarantee holds on
 > every format, on CPU and GPU. See the [roadmap](docs/roadmap.md).
 
+## Install
+
+Apple Silicon Mac (macOS 14+):
+
+```sh
+# Prebuilt binary — grab the latest release tarball, unpack, run:
+#   https://github.com/nobottomline/ullm/releases/latest
+tar -xzf ullm-*-aarch64-apple-darwin.tar.gz && ./ullm-*/ullm doctor
+
+# ...or from source (needs Rust):
+cargo build --release      # binary at ./target/release/ullm
+# or: cargo install --path crates/ullm-cli
+```
+
+Homebrew (`brew install nobottomline/ullm/ullm`) is on the way.
+
 ## Quickstart
 
 ```sh
-cargo build --release   # binary at ./target/release/ullm
-
 # Generate from a GGUF file, or a Hugging Face / MLX directory. Drop --gpu for CPU.
 ullm run model.gguf "The capital of France is" --gpu
 
