@@ -452,7 +452,7 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
     let model_id = s.model_id.clone();
 
     // Tool calling takes precedence: constrain to a valid function call, render
-    // the tools into a system message, and return `tool_calls` (non-streaming).
+    // the tools into a system message, and return `tool_calls` (streamed or not).
     match tool_plan(&req) {
         Err(e) => return bad_request(format!("invalid tools: {e}")),
         Ok(Some(plan)) => {
@@ -468,6 +468,25 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
             let engine = s.engine.clone();
             let grammar = plan.grammar;
             let p = params.clone();
+
+            if req.stream == Some(true) {
+                let (tx, rx) = mpsc::channel::<std::result::Result<Event, Infallible>>(64);
+                let mid = model_id;
+                tokio::task::spawn_blocking(move || {
+                    let send = |data: String| {
+                        let _ = tx.blocking_send(Ok(Event::default().data(data)));
+                    };
+                    send(chunk_json(&mid, Some("assistant"), None, None));
+                    let text = {
+                        let mut e = engine.lock().expect("engine mutex poisoned");
+                        e.complete(&prompt, max_tokens, &p, Some(&grammar)).0
+                    };
+                    stream_tool_call(&mid, &text, &send);
+                    send("[DONE]".to_string());
+                });
+                return Sse::new(ReceiverStream::new(rx)).into_response();
+            }
+
             let (text, pt, ct) = tokio::task::spawn_blocking(move || {
                 let mut e = engine.lock().expect("engine mutex poisoned");
                 e.complete(&prompt, max_tokens, &p, Some(&grammar))
@@ -543,40 +562,26 @@ async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatRequest
 /// Turn the (grammar-constrained) model output into an OpenAI `tool_calls`
 /// response. Falls back to plain content if it somehow isn't a `{name,...}`.
 fn tool_call_response(model_id: String, text: &str, pt: usize, ct: usize) -> Response {
-    let trimmed = text.trim();
-    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
-    let (message, finish) = match parsed.as_ref().filter(|v| v.get("name").is_some()) {
-        Some(v) => {
-            let name = v
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let arguments = v
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let arg_str = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into());
-            (
-                OutMessage {
-                    role: "assistant",
-                    content: None,
-                    tool_calls: Some(vec![ToolCallOut {
-                        id: format!("call_{name}"),
-                        kind: "function",
-                        function: FnOut {
-                            name,
-                            arguments: arg_str,
-                        },
-                    }]),
-                },
-                "tool_calls",
-            )
-        }
+    let (message, finish) = match parse_tool_call(text) {
+        Some((name, arg_str)) => (
+            OutMessage {
+                role: "assistant",
+                content: None,
+                tool_calls: Some(vec![ToolCallOut {
+                    id: format!("call_{name}"),
+                    kind: "function",
+                    function: FnOut {
+                        name,
+                        arguments: arg_str,
+                    },
+                }]),
+            },
+            "tool_calls",
+        ),
         None => (
             OutMessage {
                 role: "assistant",
-                content: Some(trimmed.to_string()),
+                content: Some(text.trim().to_string()),
                 tool_calls: None,
             },
             "stop",
@@ -601,6 +606,73 @@ fn tool_call_response(model_id: String, text: &str, pt: usize, ct: usize) -> Res
     .into_response()
 }
 
+/// Parse the (grammar-constrained) `{"name":...,"arguments":...}` into the
+/// function name and its arguments as a JSON string (OpenAI's wire format).
+fn parse_tool_call(text: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    let arguments = v
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let arg_str = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into());
+    Some((name, arg_str))
+}
+
+/// Emit a parsed tool call as OpenAI streaming `tool_calls` deltas: announce the
+/// function (id + name), stream the arguments string in pieces, then finish.
+fn stream_tool_call(model: &str, text: &str, send: &impl Fn(String)) {
+    match parse_tool_call(text) {
+        Some((name, args)) => {
+            send(emit_chunk(
+                model,
+                Delta {
+                    tool_calls: Some(vec![DeltaToolCall {
+                        index: 0,
+                        id: Some(format!("call_{name}")),
+                        kind: Some("function"),
+                        function: DeltaFunction {
+                            name: Some(name),
+                            arguments: Some(String::new()),
+                        },
+                    }]),
+                    ..Delta::default()
+                },
+                None,
+            ));
+            for piece in chunk_chars(&args, 24) {
+                send(emit_chunk(
+                    model,
+                    Delta {
+                        tool_calls: Some(vec![DeltaToolCall {
+                            index: 0,
+                            id: None,
+                            kind: None,
+                            function: DeltaFunction {
+                                name: None,
+                                arguments: Some(piece),
+                            },
+                        }]),
+                        ..Delta::default()
+                    },
+                    None,
+                ));
+            }
+            send(chunk_json(model, None, None, Some("tool_calls")));
+        }
+        None => {
+            send(chunk_json(model, None, Some(text.trim()), None));
+            send(chunk_json(model, None, None, Some("stop")));
+        }
+    }
+}
+
+/// Split `s` into pieces of at most `n` characters (never mid-codepoint).
+fn chunk_chars(s: &str, n: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    chars.chunks(n).map(|c| c.iter().collect()).collect()
+}
+
 #[derive(Serialize)]
 struct ChatChunk {
     id: &'static str,
@@ -618,21 +690,36 @@ struct ChunkChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
-/// Serialize one OpenAI `chat.completion.chunk`.
-fn chunk_json(
-    model: &str,
-    role: Option<&str>,
-    content: Option<&str>,
-    finish: Option<&str>,
-) -> String {
+#[derive(Serialize)]
+struct DeltaToolCall {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    function: DeltaFunction,
+}
+
+#[derive(Serialize, Default)]
+struct DeltaFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<String>,
+}
+
+/// Serialize a `chat.completion.chunk` with a ready-made delta.
+fn emit_chunk(model: &str, delta: Delta, finish: Option<&str>) -> String {
     let chunk = ChatChunk {
         id: "chatcmpl-ullm",
         object: "chat.completion.chunk",
@@ -640,14 +727,29 @@ fn chunk_json(
         model: model.to_string(),
         choices: vec![ChunkChoice {
             index: 0,
-            delta: Delta {
-                role: role.map(str::to_string),
-                content: content.map(str::to_string),
-            },
+            delta,
             finish_reason: finish.map(str::to_string),
         }],
     };
     serde_json::to_string(&chunk).unwrap_or_default()
+}
+
+/// Serialize one role/content/finish `chat.completion.chunk`.
+fn chunk_json(
+    model: &str,
+    role: Option<&str>,
+    content: Option<&str>,
+    finish: Option<&str>,
+) -> String {
+    emit_chunk(
+        model,
+        Delta {
+            role: role.map(str::to_string),
+            content: content.map(str::to_string),
+            tool_calls: None,
+        },
+        finish,
+    )
 }
 
 /// Read a Hugging Face model's chat template (`chat_template.jinja` or the

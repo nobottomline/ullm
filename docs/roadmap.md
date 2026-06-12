@@ -70,7 +70,10 @@ level, so invalid output is impossible — on any format, on CPU and GPU.
   `--regex` yields a conforming date; a `format:"uuid"` schema yields a matching
   UUID. (Whitespace in schema grammars is now bounded — an unbounded leading
   `ws` let a greedy model stall on whitespace.)
-- ☐ Streaming `tool_calls` deltas (tool calls are non-streamed today)
+- ☑ Streaming `tool_calls` deltas — a `stream:true` request with `tools` now
+  returns proper OpenAI SSE: a role chunk, a tool-call announcement (id + name),
+  the arguments string in chunks, then `finish_reason:"tool_calls"`. Validated by
+  reassembling the deltas and checking the arguments against the function schema
 - ☐ Schema `additionalProperties` schema, `maxItems`, `minLength`/`maxLength`
 
 ## Phase 2 — Serving & scale
