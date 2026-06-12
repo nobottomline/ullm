@@ -179,7 +179,7 @@ pub struct GpuForward {
     p_gelu_mul: ComputePipelineState,
     p_add: ComputePipelineState,
     p_matvec_mlx4: ComputePipelineState,
-    p_matmul_bf16: ComputePipelineState,
+    p_matmul_bf16_tiled: ComputePipelineState,
     p_matmul_mlx4: ComputePipelineState,
     p_matmul_q4k: ComputePipelineState,
     p_matmul_q6k: ComputePipelineState,
@@ -323,7 +323,7 @@ impl GpuForward {
             p_gelu_mul: pso("gelu_mul")?,
             p_add: pso("add_inplace")?,
             p_matvec_mlx4: pso("matvec_mlx4")?,
-            p_matmul_bf16: pso("matmul_bf16")?,
+            p_matmul_bf16_tiled: pso("matmul_bf16_tiled")?,
             p_matmul_mlx4: pso("matmul_mlx4")?,
             p_matmul_q4k: pso("matmul_q4k")?,
             p_matmul_q6k: pso("matmul_q6k")?,
@@ -700,7 +700,7 @@ impl GpuForward {
         }
         // BF16 and the k-quants share the (w, x, y, in, out, n_cols) signature.
         let pso = match w.dtype {
-            DType::BF16 => &self.p_matmul_bf16,
+            DType::BF16 => &self.p_matmul_bf16_tiled,
             DType::Q4K => &self.p_matmul_q4k,
             DType::Q6K => &self.p_matmul_q6k,
             _ => return false,

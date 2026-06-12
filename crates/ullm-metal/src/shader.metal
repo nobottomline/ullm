@@ -510,6 +510,57 @@ kernel void matmul_bf16(
     }
 }
 
+// Batched BF16 matmul, x-tiled. Same result as `matmul_bf16` but the T token
+// columns of the activation are staged into threadgroup memory ONCE per in_dim
+// chunk and shared by all `nsg` simdgroups (each computing a different output
+// row), so the strided token-major x reads — the bottleneck of the plain kernel
+// — drop ~nsg-fold and the matmul becomes weight-bound. All threads cooperate on
+// the load + barriers (no early-out), only o < out_dim writes.
+kernel void matmul_bf16_tiled(
+    device const ushort* w       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        y       [[buffer(2)]],
+    constant uint&       in_dim  [[buffer(3)]],
+    constant uint&       out_dim [[buffer(4)]],
+    constant uint&       n_cols  [[buffer(5)]],
+    uint2  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint T = 8;
+    const uint CHUNK = 256;
+    threadgroup float xt[T * CHUNK]; // T token columns x CHUNK in-dim
+    uint o = (uint)tgpig.x * nsg + sgitg;
+    uint col0 = (uint)tgpig.y * T;
+    uint tid = (uint)sgitg * 32u + tiisg;
+    uint nthreads = (uint)nsg * 32u;
+    device const ushort* wrow = w + (uint)o * in_dim;
+    float acc[T];
+    for (uint t = 0; t < T; ++t) acc[t] = 0.f;
+
+    for (uint c0 = 0; c0 < in_dim; c0 += CHUNK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup); // prev chunk done reading xt
+        for (uint idx = tid; idx < T * CHUNK; idx += nthreads) {
+            uint t = idx / CHUNK, j = idx % CHUNK, i = c0 + j, s = col0 + t;
+            xt[idx] = (i < in_dim && s < n_cols) ? x[s * in_dim + i] : 0.f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup); // xt filled
+        if (o < out_dim) {
+            uint jmax = min(CHUNK, in_dim - c0);
+            for (uint j = tiisg; j < jmax; j += 32u) {
+                float wv = as_type<float>((uint)wrow[c0 + j] << 16);
+                for (uint t = 0; t < T; ++t) acc[t] += wv * xt[t * CHUNK + j];
+            }
+        }
+    }
+    for (uint t = 0; t < T; ++t) {
+        float r = simd_sum(acc[t]);
+        uint s = col0 + t;
+        if (tiisg == 0 && o < out_dim && s < n_cols) y[s * out_dim + o] = r;
+    }
+}
+
 // Batched MLX 4-bit matmul (prompt prefill): packed-u32 weights dequantized in
 // the kernel (q*scale+bias, 8 nibbles/word LSB-first), W[out,in] x X[S,in] ->
 // Y[S,out]. One simdgroup per output row computes a tile of T columns, reading
