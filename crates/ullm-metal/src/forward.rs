@@ -444,7 +444,16 @@ impl GpuForward {
             } else {
                 0
             };
-            self.attn_scores(enc, &self.q, 0, kv_layer_off, kv_mul, scale, seqlen, attn_start);
+            self.attn_scores(
+                enc,
+                &self.q,
+                0,
+                kv_layer_off,
+                kv_mul,
+                scale,
+                seqlen,
+                attn_start,
+            );
             self.attn_softmax(enc, seqlen, attn_start);
             self.attn_output(enc, &self.attn, 0, kv_layer_off, kv_mul, seqlen, attn_start);
 
@@ -766,11 +775,7 @@ impl GpuForward {
 
         // SAFETY: shared storage; `embeds` has exactly `s * n_embd` f32.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                embeds.as_ptr(),
-                xs.contents().cast::<f32>(),
-                s * n_embd,
-            );
+            std::ptr::copy_nonoverlapping(embeds.as_ptr(), xs.contents().cast::<f32>(), s * n_embd);
         }
 
         let cmd = self.queue.new_command_buffer();
@@ -811,7 +816,14 @@ impl GpuForward {
                     }
                 }
                 self.rope(enc, rope_pso, &qs, q_off, p.n_head as u32, t as u32);
-                self.rope(enc, rope_pso, &self.key_cache, kv_off, p.n_kv_head as u32, t as u32);
+                self.rope(
+                    enc,
+                    rope_pso,
+                    &self.key_cache,
+                    kv_off,
+                    p.n_kv_head as u32,
+                    t as u32,
+                );
             }
 
             // per-token causal attention into `attns`
@@ -823,7 +835,16 @@ impl GpuForward {
                 } else {
                     0
                 };
-                self.attn_scores(enc, &qs, q_off, kv_layer_off, kv_mul, scale, seqlen, attn_start);
+                self.attn_scores(
+                    enc,
+                    &qs,
+                    q_off,
+                    kv_layer_off,
+                    kv_mul,
+                    scale,
+                    seqlen,
+                    attn_start,
+                );
                 self.attn_softmax(enc, seqlen, attn_start);
                 self.attn_output(enc, &attns, q_off, kv_layer_off, kv_mul, seqlen, attn_start);
             }

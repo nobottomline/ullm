@@ -327,13 +327,18 @@ fn prefill_check(path: &Path, prompt: &str, gpu: bool) {
     let r = if gpu {
         match lm.gpu_prefill_check(&ids) {
             Some(r) => r,
-            None => die("gpu prefill-check: model has no batched-prefill kernel (needs BF16 / MLX 4-bit / Q4_K / Q6_K, dense FFN)"),
+            None => die(
+                "gpu prefill-check: model has no batched-prefill kernel (needs BF16 / MLX 4-bit / Q4_K / Q6_K, dense FFN)",
+            ),
         }
     } else {
         lm.prefill_check(&ids)
     };
 
-    println!("prefill-check ({}): {path:?}", if gpu { "gpu" } else { "cpu" });
+    println!(
+        "prefill-check ({}): {path:?}",
+        if gpu { "gpu" } else { "cpu" }
+    );
     println!("  tokens:        {}", ids.len());
     println!(
         "  batch argmax:  {}  ({:?})",
