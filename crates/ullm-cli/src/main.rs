@@ -43,8 +43,8 @@ enum Command {
         path: PathBuf,
         /// The prompt text.
         prompt: String,
-        /// Cap on generated tokens (generation also stops at EOS / the context
-        /// limit). A safety bound; raise it for long answers.
+        /// Cap on generated tokens (also stops at EOS / context). A safety
+        /// bound; 0 = until the model stops or the context window fills.
         #[arg(long, default_value_t = 512)]
         max_tokens: usize,
         /// Sampling temperature (0 = greedy / deterministic).
@@ -95,8 +95,9 @@ enum Command {
         /// Nucleus sampling threshold (1.0 = disabled).
         #[arg(long, default_value_t = 0.95)]
         top_p: f32,
-        /// Cap on generated tokens per reply.
-        #[arg(long, default_value_t = 512)]
+        /// Cap on generated tokens per reply (0 = until the model stops or the
+        /// context window fills).
+        #[arg(long, default_value_t = 0)]
         max_tokens: usize,
         /// Penalty on recently-used tokens (1.0 = off).
         #[arg(long, default_value_t = 1.1)]
@@ -680,6 +681,12 @@ fn run(
     let t_load = std::time::Instant::now();
     let (tk, mut lm, template) = load_model(path, gpu);
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    // 0 = generate until EOS or the context window fills.
+    let max_new = if max_tokens == 0 {
+        lm.context_len()
+    } else {
+        max_tokens
+    };
 
     // Wrap the prompt in the model's chat template so an instruct model answers
     // instead of free-completing the raw text. `--raw` (or a base model with no
@@ -720,7 +727,7 @@ fn run(
     let mut out = std::io::stdout();
     lm.generate_stream(
         &prompt_ids,
-        max_tokens,
+        max_new,
         tk.eos_id(),
         &params,
         constraint
@@ -790,6 +797,15 @@ fn chat(path: &Path, system: Option<&str>, gpu: bool, max_tokens: usize, params:
         .and_then(|s| s.to_str())
         .unwrap_or("model");
 
+    // `max_tokens == 0` means "reply until EOS or the context fills". `cap`
+    // bounds a single reply; `reserve` is the headroom kept free when trimming.
+    let cap = if max_tokens == 0 {
+        lm.context_len()
+    } else {
+        max_tokens
+    };
+    let reserve = if max_tokens == 0 { 512 } else { max_tokens };
+
     // History as (role, content). The system message (if any) is never trimmed.
     let mut history: Vec<(String, String)> = Vec::new();
     if let Some(sys) = system {
@@ -831,7 +847,7 @@ fn chat(path: &Path, system: Option<&str>, gpu: bool, max_tokens: usize, params:
                 .map(|(r, c)| (r.as_str(), c.as_str()))
                 .collect();
             let ids = tk.encode(&fmt.build_prompt(&pairs), true);
-            if ids.len() + max_tokens < lm.context_len() {
+            if ids.len() + reserve < lm.context_len() {
                 break ids;
             }
             match history.iter().position(|(r, _)| r != "system") {
@@ -845,7 +861,7 @@ fn chat(path: &Path, system: Option<&str>, gpu: bool, max_tokens: usize, params:
         // Stream the reply, decoding incrementally.
         let mut gen_ids: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        lm.generate_stream(&prompt_ids, max_tokens, tk.eos_id(), &params, None, |id| {
+        lm.generate_stream(&prompt_ids, cap, tk.eos_id(), &params, None, |id| {
             gen_ids.push(id);
             let text = tk.decode(&gen_ids);
             let stable = text.trim_end_matches('\u{FFFD}');
