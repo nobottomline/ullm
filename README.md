@@ -50,14 +50,15 @@ ullm run model.gguf "Date two days after 2024-01-13:" --regex '[0-9]{4}-[0-9]{2}
 
 # OpenAI-compatible server with Structured Outputs + tool calling:
 ullm serve model.gguf --gpu     # http://127.0.0.1:8080
-curl localhost:8080/v1/chat/completions -d '{
+curl 127.0.0.1:8080/v1/chat/completions -d '{
   "messages": [{"role":"user","content":"Extract: Acme blender, 5 stars."}],
   "response_format": {"type":"json_schema","json_schema":{"schema":
     {"type":"object","properties":{"product":{"type":"string"},"rating":{"type":"integer"}},
      "required":["product","rating"]}}}}'   # content is guaranteed to match the schema
 ```
 
-`ullm --help` also has `inspect`, `tokenize`, `doctor`, and `gpu-check`.
+`ullm --help` also has `inspect`, `tokenize`, `doctor`, and `gpu-check`. Runnable
+Python (OpenAI SDK) and Rust (embedded) samples are in [`examples/`](examples).
 
 ## What it does
 
