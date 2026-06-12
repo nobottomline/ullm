@@ -474,6 +474,42 @@ kernel void matvec_bf16_mr(
     }
 }
 
+// Batched BF16 matmul (prompt prefill): W[out,in] x X[S,in] -> Y[S,out], both
+// activation matrices row-major (token-major). Each simdgroup computes one output
+// row for a tile of T columns, reading W[o] ONCE and reusing it across the tile —
+// the key to fast prefill (vs S separate matvecs each re-reading the weight).
+kernel void matmul_bf16(
+    device const ushort* w       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        y       [[buffer(2)]],
+    constant uint&       in_dim  [[buffer(3)]],
+    constant uint&       out_dim [[buffer(4)]],
+    constant uint&       n_cols  [[buffer(5)]],
+    uint2  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint T = 4;
+    uint o = (uint)tgpig.x * nsg + sgitg;
+    uint col0 = (uint)tgpig.y * T;
+    if (o >= out_dim) return;
+    device const ushort* wrow = w + (uint)o * in_dim;
+    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    for (uint i = tiisg; i < in_dim; i += 32u) {
+        float wv = as_type<float>((uint)wrow[i] << 16);
+        for (uint t = 0; t < T; ++t) {
+            uint s = col0 + t;
+            if (s < n_cols) acc[t] += wv * x[s * in_dim + i];
+        }
+    }
+    for (uint t = 0; t < T; ++t) {
+        float r = simd_sum(acc[t]);
+        uint s = col0 + t;
+        if (tiisg == 0 && s < n_cols) y[s * out_dim + o] = r;
+    }
+}
+
 // Multi-row F16 matvec (same layout, half -> float).
 kernel void matvec_f16_mr(
     device const half*  src0    [[buffer(0)]],

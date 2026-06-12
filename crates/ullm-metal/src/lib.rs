@@ -22,6 +22,7 @@ pub struct MetalContext {
     q4k_pso: ComputePipelineState,
     q6k_pso: ComputePipelineState,
     mlx4_pso: ComputePipelineState,
+    matmul_bf16_pso: ComputePipelineState,
 }
 
 impl MetalContext {
@@ -46,6 +47,7 @@ impl MetalContext {
             q4k_pso: pso("matvec_q4k")?,
             q6k_pso: pso("matvec_q6k")?,
             mlx4_pso: pso("matvec_mlx4")?,
+            matmul_bf16_pso: pso("matmul_bf16")?,
             queue,
             device,
         })
@@ -149,6 +151,55 @@ impl MetalContext {
         // SAFETY: shared storage; `ybuf` holds `out_dim` f32 after completion.
         unsafe {
             std::ptr::copy_nonoverlapping(ybuf.contents().cast::<f32>(), out.as_mut_ptr(), out_dim);
+        }
+        out
+    }
+
+    /// Batched BF16 matmul: `w` row-major `[out, in]` BF16 (2 bytes/elt), `x`
+    /// row-major (token-major) `[s, in]` f32 -> `[s, out]` f32. Reads each weight
+    /// row once and reuses it across all `s` columns — the prefill primitive.
+    pub fn matmul_bf16(
+        &self,
+        w: &[u8],
+        x: &[f32],
+        out_dim: usize,
+        in_dim: usize,
+        s: usize,
+    ) -> Vec<f32> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let wbuf = self.upload(w);
+        let xbuf =
+            self.device
+                .new_buffer_with_data(x.as_ptr().cast(), (x.len() * 4) as u64, shared);
+        let ybuf = self.device.new_buffer((s * out_dim * 4) as u64, shared);
+
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.matmul_bf16_pso);
+        enc.set_buffer(0, Some(&wbuf), 0);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&ybuf), 0);
+        let (inu, outu, su) = (in_dim as u32, out_dim as u32, s as u32);
+        enc.set_bytes(3, 4, (&inu as *const u32).cast());
+        enc.set_bytes(4, 4, (&outu as *const u32).cast());
+        enc.set_bytes(5, 4, (&su as *const u32).cast());
+        let nsg = 8u64; // simdgroups per threadgroup (one output row each)
+        let t_cols = 4u64; // columns (tokens) per simdgroup, must match T in the kernel
+        let gx = (out_dim as u64).div_ceil(nsg);
+        let gy = (s as u64).div_ceil(t_cols);
+        enc.dispatch_thread_groups(MTLSize::new(gx, gy, 1), MTLSize::new(32 * nsg, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut out = vec![0.0f32; s * out_dim];
+        // SAFETY: shared storage; `ybuf` holds `s*out_dim` f32 after completion.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ybuf.contents().cast::<f32>(),
+                out.as_mut_ptr(),
+                s * out_dim,
+            );
         }
         out
     }
@@ -315,5 +366,45 @@ mod tests {
             .collect();
         let gpu = ctx.matvec_mlx4(&w, &scales, &biases, &x, out, inn, gs);
         assert!(rel_err(&gpu, &cpu) < 1e-3, "MLX4 kernel mismatch");
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn matmul_bf16_matches_cpu() {
+        let Ok(ctx) = MetalContext::new() else {
+            return; // no GPU (e.g. CI) — skip
+        };
+        let (out, inn, s) = (96usize, 320usize, 7usize); // 7 = not a multiple of T
+        // f32 weights truncated to BF16 (top 16 bits), packed little-endian.
+        let wbf: Vec<u16> = (0..out * inn)
+            .map(|k| (f32::to_bits(((k * 7 % 23) as f32 - 11.0) * 0.013) >> 16) as u16)
+            .collect();
+        let wbytes: Vec<u8> = wbf.iter().flat_map(|&h| h.to_le_bytes()).collect();
+        let x: Vec<f32> = (0..s * inn)
+            .map(|k| ((k * 13 % 17) as f32 - 8.0) * 0.02)
+            .collect();
+        let gpu = ctx.matmul_bf16(&wbytes, &x, out, inn, s);
+
+        // CPU reference uses the same BF16-truncated weights.
+        let weff: Vec<f32> = wbf
+            .iter()
+            .map(|&h| f32::from_bits((h as u32) << 16))
+            .collect();
+        let mut cpu = vec![0.0f32; s * out];
+        for si in 0..s {
+            for o in 0..out {
+                let mut acc = 0.0f32;
+                for i in 0..inn {
+                    acc += weff[o * inn + i] * x[si * inn + i];
+                }
+                cpu[si * out + o] = acc;
+            }
+        }
+        let max = gpu
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 1e-3, "BF16 matmul GPU vs CPU max diff {max}");
     }
 }
