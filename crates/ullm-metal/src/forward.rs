@@ -178,6 +178,7 @@ pub struct GpuForward {
     p_attn_scores: ComputePipelineState,
     p_attn_softmax: ComputePipelineState,
     p_attn_output: ComputePipelineState,
+    p_attn_flash_batch: ComputePipelineState,
     p_silu_mul: ComputePipelineState,
     p_gelu_mul: ComputePipelineState,
     p_add: ComputePipelineState,
@@ -325,6 +326,7 @@ impl GpuForward {
             p_attn_scores: pso("attn_scores")?,
             p_attn_softmax: pso("attn_softmax")?,
             p_attn_output: pso("attn_output")?,
+            p_attn_flash_batch: pso("attn_flash_batch")?,
             p_silu_mul: pso("silu_mul")?,
             p_gelu_mul: pso("gelu_mul")?,
             p_add: pso("add_inplace")?,
@@ -850,28 +852,10 @@ impl GpuForward {
                 s as u32,
             );
 
-            // per-token causal attention into `attns`
-            for t in 0..s {
-                let seqlen = (t + 1) as u32;
-                let q_off = (t * q_dim * 4) as u64;
-                let attn_start = if p.sliding_window > 0 && l % 6 != 5 && t + 1 > p.sliding_window {
-                    (t + 1 - p.sliding_window) as u32
-                } else {
-                    0
-                };
-                self.attn_scores(
-                    enc,
-                    &qs,
-                    q_off,
-                    kv_layer_off,
-                    kv_mul,
-                    scale,
-                    seqlen,
-                    attn_start,
-                );
-                self.attn_softmax(enc, seqlen, attn_start);
-                self.attn_output(enc, &attns, q_off, kv_layer_off, kv_mul, seqlen, attn_start);
-            }
+            // causal attention for all query tokens in one flash dispatch.
+            // Gemma local layers (every layer but each 6th) use the sliding window.
+            let local = u32::from(p.sliding_window > 0 && l % 6 != 5);
+            self.attn_flash_batch(enc, &qs, &attns, kv_layer_off, kv_mul, scale, local, s);
 
             // output projection + optional post-norm + residual
             self.matmul(enc, &lw.wo, &attns, &xbs, 0, s);
@@ -1122,6 +1106,44 @@ impl GpuForward {
         enc.set_bytes(4, 4, (&self.p.rope_theta as *const f32).cast());
         enc.set_bytes(5, 4, (&row_stride as *const u32).cast());
         dispatch_1d(enc, pso, (rows * n_heads * (hd / 2)) as u64);
+    }
+
+    /// Flash-style batched causal attention: all `s` query tokens × heads in one
+    /// dispatch (one simdgroup each), single-pass online softmax. `local` is 1 for
+    /// a sliding-window layer. Reads Q from `q[0..]`, K/V at the layer offset,
+    /// writes `out[0..]` — all token-major `[s, q_dim]` / cache-resident.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_flash_batch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        q: &Buffer,
+        out: &Buffer,
+        kv_layer_off: u64,
+        kv_mul: u32,
+        scale: f32,
+        local: u32,
+        s: usize,
+    ) {
+        enc.set_compute_pipeline_state(&self.p_attn_flash_batch);
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(&self.key_cache), kv_layer_off);
+        enc.set_buffer(2, Some(&self.val_cache), kv_layer_off);
+        enc.set_buffer(3, Some(out), 0);
+        let hd = self.p.head_dim as u32;
+        let q_dim = (self.p.n_head * self.p.head_dim) as u32;
+        let kv_dim = (self.p.n_kv_head * self.p.head_dim) as u32;
+        let sliding = self.p.sliding_window as u32;
+        enc.set_bytes(4, 4, (&hd as *const u32).cast());
+        enc.set_bytes(5, 4, (&q_dim as *const u32).cast());
+        enc.set_bytes(6, 4, (&kv_dim as *const u32).cast());
+        enc.set_bytes(7, 4, (&kv_mul as *const u32).cast());
+        enc.set_bytes(8, 4, (&scale as *const f32).cast());
+        enc.set_bytes(9, 4, (&sliding as *const u32).cast());
+        enc.set_bytes(10, 4, (&local as *const u32).cast());
+        enc.dispatch_thread_groups(
+            MTLSize::new(s as u64, self.p.n_head as u64, 1),
+            MTLSize::new(32, 1, 1),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

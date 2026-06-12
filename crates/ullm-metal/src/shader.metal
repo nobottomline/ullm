@@ -1020,6 +1020,59 @@ kernel void attn_output(
     out[h * head_dim + d] = acc;
 }
 
+// Flash-style causal attention for prefill: one simdgroup per (query token t,
+// head h) streams keys start..=t with a single-pass online softmax, so the whole
+// prompt's attention is ONE dispatch (grid = S × n_head) instead of 3·S kernels
+// (scores → softmax → output) and needs no [S, n_ctx] scores buffer. Lane i owns
+// head dims i, i+32, … (≤ 8 entries for head_dim ≤ 256); simd_sum reduces the
+// q·K dot, scalars stay identical across lanes. Numerically equal to the
+// three-kernel path. `local` marks a sliding-window layer (else full attention).
+kernel void attn_flash_batch(
+    device const float* q        [[buffer(0)]],  // [S, q_dim] at offset 0
+    device const float* kcache   [[buffer(1)]],  // bound at the layer offset
+    device const float* vcache   [[buffer(2)]],  // bound at the layer offset
+    device float*       out      [[buffer(3)]],  // [S, q_dim] at offset 0
+    constant uint&      head_dim [[buffer(4)]],
+    constant uint&      q_dim    [[buffer(5)]],
+    constant uint&      kv_dim   [[buffer(6)]],
+    constant uint&      kv_mul   [[buffer(7)]],
+    constant float&     scale    [[buffer(8)]],
+    constant uint&      sliding  [[buffer(9)]],
+    constant uint&      local    [[buffer(10)]],
+    uint2  tgpig [[threadgroup_position_in_grid]], // x = query token t, y = head h
+    ushort lane  [[thread_index_in_simdgroup]])
+{
+    uint t = tgpig.x, h = tgpig.y;
+    uint kvh = h / kv_mul;
+    device const float* qh = q + (uint)t * q_dim + h * head_dim;
+    float qreg[8];
+    uint nper = 0;
+    for (uint d = lane; d < head_dim; d += 32u) qreg[nper++] = qh[d];
+    uint start = (sliding > 0u && local != 0u && t + 1u > sliding) ? (t + 1u - sliding) : 0u;
+    float m = -INFINITY, l = 0.0f;
+    float acc[8];
+    for (uint j = 0; j < nper; ++j) acc[j] = 0.0f;
+    for (uint k = start; k <= t; ++k) {
+        device const float* kk = kcache + (uint)k * kv_dim + kvh * head_dim;
+        float partial = 0.0f;
+        uint j = 0;
+        for (uint d = lane; d < head_dim; d += 32u) partial += qreg[j++] * kk[d];
+        float score = scale * simd_sum(partial);
+        float m_new = max(m, score);
+        float corr = exp(m - m_new);   // first key: exp(-inf)=0, so acc/l reset to it
+        float p = exp(score - m_new);
+        l = l * corr + p;
+        device const float* vk = vcache + (uint)k * kv_dim + kvh * head_dim;
+        j = 0;
+        for (uint d = lane; d < head_dim; d += 32u) { acc[j] = acc[j] * corr + p * vk[d]; ++j; }
+        m = m_new;
+    }
+    float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    device float* oh = out + (uint)t * q_dim + h * head_dim;
+    uint j = 0;
+    for (uint d = lane; d < head_dim; d += 32u) oh[d] = acc[j++] * inv;
+}
+
 // SwiGLU: hidden[i] = silu(gate[i]) * up[i].
 kernel void silu_mul(
     device const float* gate [[buffer(0)]],
