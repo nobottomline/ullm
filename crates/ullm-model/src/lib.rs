@@ -888,7 +888,7 @@ impl LlamaModel {
         if !prompt.is_empty() {
             let take = prompt.len().min(self.config.n_ctx);
             let did_batch = if let Some(gpu) = self.gpu.as_ref() {
-                if gpu.supports_batched_prefill() {
+                if gpu.batched_prefill_worthwhile() {
                     let n = self.config.n_embd;
                     let mut embeds = Vec::with_capacity(take * n);
                     for &tok in &prompt[..take] {
@@ -1002,7 +1002,7 @@ impl LlamaModel {
     /// GPU analogue of [`prefill_check`](Self::prefill_check): compare the GPU
     /// batched prefill against the GPU per-token forward at the final position,
     /// and time both. Returns `None` if the GPU path is inactive or the model
-    /// has no batched-prefill kernel (e.g. a quantized GGUF or an MoE model).
+    /// has no batched-prefill kernel (e.g. an MoE model or an unsupported dtype).
     pub fn gpu_prefill_check(&self, prompt: &[u32]) -> Option<PrefillCheck> {
         let gpu = self.gpu.as_ref()?;
         if !gpu.supports_batched_prefill() || prompt.is_empty() {

@@ -560,6 +560,124 @@ kernel void matmul_mlx4(
     }
 }
 
+// Batched Q4_K matmul (prompt prefill): W[out,in] x X[S,in] -> Y[S,out]. One
+// simdgroup per output row, tile of T token columns. The row's 32-weight
+// sub-blocks (8 per 256-block) are spread one-per-lane so all 32 lanes stay
+// busy; each lane dequantizes its sub-block ONCE and reuses every weight across
+// the T columns (amortizing both the weight read AND the dequant). Mirrors
+// matvec_q4k's scale unpacking; reduced with simd_sum.
+kernel void matmul_q4k(
+    device const uchar* w       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       y       [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    constant uint&      n_cols  [[buffer(5)]],
+    uint2  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint T = 4;
+    uint o = (uint)tgpig.x * nsg + sgitg;
+    uint col0 = (uint)tgpig.y * T;
+    if (o >= out_dim) return;
+    uint blocks = in_dim / 256u;
+    uint subs = blocks * 8u; // 32-weight sub-blocks in this row
+    device const uchar* row = w + (uint)o * blocks * 144u;
+    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    for (uint sb = tiisg; sb < subs; sb += 32u) {
+        uint b = sb / 8u, si = sb % 8u;
+        device const uchar* blk = row + b * 144u;
+        float d    = (float)as_type<half>((ushort)(blk[0] | (blk[1] << 8)));
+        float dmin = (float)as_type<half>((ushort)(blk[2] | (blk[3] << 8)));
+        device const uchar* sc = blk + 4;
+        device const uchar* qs = blk + 16;
+        uchar sd, sm;
+        if (si < 4u) { sd = sc[si] & 63; sm = sc[si+4] & 63; }
+        else         { sd = (sc[si+4] & 0xF) | ((sc[si-4] >> 6) << 4);
+                       sm = (sc[si+4] >> 4)  | ((sc[si]   >> 6) << 4); }
+        float dscale = d * (float)sd, dm = dmin * (float)sm;
+        uint qoff = (si / 2u) * 32u;     // qs byte offset for this sub-block
+        bool low = (si & 1u) == 0u;      // even sub-block = low nibble
+        uint col = b * 256u + si * 32u;  // first activation column
+        for (uint l = 0; l < 32u; ++l) {
+            uchar qb = qs[qoff + l];
+            float q = low ? (float)(qb & 0xF) : (float)(qb >> 4);
+            float wv = dscale * q - dm;
+            uint c = col + l;
+            for (uint t = 0; t < T; ++t) {
+                uint s = col0 + t;
+                if (s < n_cols) acc[t] += wv * x[s * in_dim + c];
+            }
+        }
+    }
+    for (uint t = 0; t < T; ++t) {
+        float r = simd_sum(acc[t]);
+        uint s = col0 + t;
+        if (tiisg == 0 && s < n_cols) y[s * out_dim + o] = r;
+    }
+}
+
+// Batched Q6_K matmul (prompt prefill): mirrors matvec_q6k; block-per-lane,
+// dequantized once and reused across the T-column tile, reduced with simd_sum.
+kernel void matmul_q6k(
+    device const uchar* w       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       y       [[buffer(2)]],
+    constant uint&      in_dim  [[buffer(3)]],
+    constant uint&      out_dim [[buffer(4)]],
+    constant uint&      n_cols  [[buffer(5)]],
+    uint2  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort nsg   [[simdgroups_per_threadgroup]])
+{
+    const uint T = 4;
+    uint o = (uint)tgpig.x * nsg + sgitg;
+    uint col0 = (uint)tgpig.y * T;
+    if (o >= out_dim) return;
+    uint blocks = in_dim / 256u;
+    device const uchar* row = w + (uint)o * blocks * 210u;
+    float acc[T] = { 0.f, 0.f, 0.f, 0.f };
+    for (uint b = tiisg; b < blocks; b += 32u) {
+        device const uchar* blk = row + b * 210u;
+        device const uchar* ql = blk;
+        device const uchar* qh = blk + 128;
+        device const char*  sc = (device const char*)(blk + 192);
+        float d = (float)as_type<half>((ushort)(blk[208] | (blk[209] << 8)));
+        uint xbase = b * 256u;
+        for (uint nh = 0; nh < 2; ++nh) {
+            uint qlo = nh*64u, qho = nh*32u, sco = nh*8u, yo = nh*128u;
+            for (uint l = 0; l < 32; ++l) {
+                uint is = l / 16u;
+                int q1 = (int)((ql[qlo+l]    & 0xF) | ((int)(qh[qho+l]       & 3) << 4)) - 32;
+                int q2 = (int)((ql[qlo+l+32] & 0xF) | ((int)((qh[qho+l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql[qlo+l]    >> 4) | ((int)((qh[qho+l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql[qlo+l+32] >> 4) | ((int)((qh[qho+l] >> 6) & 3) << 4)) - 32;
+                float w1 = d * (float)sc[sco+is]   * (float)q1;
+                float w2 = d * (float)sc[sco+is+2] * (float)q2;
+                float w3 = d * (float)sc[sco+is+4] * (float)q3;
+                float w4 = d * (float)sc[sco+is+6] * (float)q4;
+                uint c1 = xbase + yo + l;
+                for (uint t = 0; t < T; ++t) {
+                    uint s = col0 + t;
+                    if (s < n_cols) {
+                        device const float* xr = x + s * in_dim;
+                        acc[t] += w1 * xr[c1] + w2 * xr[c1 + 32]
+                                + w3 * xr[c1 + 64] + w4 * xr[c1 + 96];
+                    }
+                }
+            }
+        }
+    }
+    for (uint t = 0; t < T; ++t) {
+        float r = simd_sum(acc[t]);
+        uint s = col0 + t;
+        if (tiisg == 0 && s < n_cols) y[s * out_dim + o] = r;
+    }
+}
+
 // Multi-row F16 matvec (same layout, half -> float).
 kernel void matvec_f16_mr(
     device const half*  src0    [[buffer(0)]],

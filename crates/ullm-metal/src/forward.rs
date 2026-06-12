@@ -181,6 +181,8 @@ pub struct GpuForward {
     p_matvec_mlx4: ComputePipelineState,
     p_matmul_bf16: ComputePipelineState,
     p_matmul_mlx4: ComputePipelineState,
+    p_matmul_q4k: ComputePipelineState,
+    p_matmul_q6k: ComputePipelineState,
     p_moe_topk: ComputePipelineState,
     p_moe_gate_up_all: ComputePipelineState,
     p_moe_down_all: ComputePipelineState,
@@ -323,6 +325,8 @@ impl GpuForward {
             p_matvec_mlx4: pso("matvec_mlx4")?,
             p_matmul_bf16: pso("matmul_bf16")?,
             p_matmul_mlx4: pso("matmul_mlx4")?,
+            p_matmul_q4k: pso("matmul_q4k")?,
+            p_matmul_q6k: pso("matmul_q6k")?,
             p_moe_topk: pso("moe_topk")?,
             p_moe_gate_up_all: pso("moe_gate_up_all")?,
             p_moe_down_all: pso("moe_down_all")?,
@@ -653,8 +657,8 @@ impl GpuForward {
 
     /// Batched matmul against a resident weight: `xs` token-major `[s, in]` ->
     /// `ys[y_off..]` `[s, out]`, reading each weight ONCE for all `s` columns.
-    /// Returns false for a dtype with no batched kernel (only BF16 and MLX 4-bit
-    /// are batched today); the caller then falls back to per-token matvecs.
+    /// Returns false for a dtype with no batched kernel (BF16, MLX 4-bit, Q4_K
+    /// and Q6_K are batched); the caller then falls back to per-token matvecs.
     fn matmul(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -683,35 +687,57 @@ impl GpuForward {
             enc.dispatch_thread_groups(grid, tg);
             return true;
         }
-        if w.dtype == DType::BF16 {
-            enc.set_compute_pipeline_state(&self.p_matmul_bf16);
-            enc.set_buffer(0, Some(&w.buf), 0);
-            enc.set_buffer(1, Some(xs), 0);
-            enc.set_buffer(2, Some(ys), y_off);
-            enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
-            enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
-            enc.set_bytes(5, 4, (&su as *const u32).cast());
-            enc.dispatch_thread_groups(grid, tg);
-            return true;
-        }
-        false
+        // BF16 and the k-quants share the (w, x, y, in, out, n_cols) signature.
+        let pso = match w.dtype {
+            DType::BF16 => &self.p_matmul_bf16,
+            DType::Q4K => &self.p_matmul_q4k,
+            DType::Q6K => &self.p_matmul_q6k,
+            _ => return false,
+        };
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(&w.buf), 0);
+        enc.set_buffer(1, Some(xs), 0);
+        enc.set_buffer(2, Some(ys), y_off);
+        enc.set_bytes(3, 4, (&in_dim as *const u32).cast());
+        enc.set_bytes(4, 4, (&out_dim as *const u32).cast());
+        enc.set_bytes(5, 4, (&su as *const u32).cast());
+        enc.dispatch_thread_groups(grid, tg);
+        true
     }
 
-    /// Whether `forward_batch` can run this model: every attention/FFN projection
-    /// has a batched matmul kernel (BF16 or MLX 4-bit) and the FFN is dense. The
-    /// output projection is excluded — prefill matvecs only its last row.
-    pub fn supports_batched_prefill(&self) -> bool {
-        let ok = |w: &WBuf| w.mlx.is_some() || w.dtype == DType::BF16;
+    /// True iff `pred` holds for every attention/FFN projection of every layer.
+    fn all_projections<F: Fn(&WBuf) -> bool>(&self, pred: F) -> bool {
         self.layers.iter().all(|l| {
-            l.moe_gate.is_none()
-                && ok(&l.wq)
-                && ok(&l.wk)
-                && ok(&l.wv)
-                && ok(&l.wo)
-                && ok(&l.w_gate)
-                && ok(&l.w_up)
-                && ok(&l.w_down)
+            pred(&l.wq)
+                && pred(&l.wk)
+                && pred(&l.wv)
+                && pred(&l.wo)
+                && pred(&l.w_gate)
+                && pred(&l.w_up)
+                && pred(&l.w_down)
         })
+    }
+
+    /// Whether `forward_batch` produces correct results for this model: every
+    /// projection has a batched matmul kernel (BF16, MLX 4-bit, Q4_K or Q6_K) and
+    /// the FFN is dense. The output projection is excluded — prefill matvecs only
+    /// its last row. (`prefill-check --gpu` validates against the per-token path.)
+    pub fn supports_batched_prefill(&self) -> bool {
+        self.layers.iter().all(|l| l.moe_gate.is_none())
+            && self.all_projections(|w| {
+                w.mlx.is_some() || matches!(w.dtype, DType::BF16 | DType::Q4K | DType::Q6K)
+            })
+    }
+
+    /// Whether batched prefill is also *faster* than per-token for this model —
+    /// true only for BF16 / MLX dense, where per-token decode is memory-bound so
+    /// the read-once batched matmul wins ~4x. The k-quant batched kernels are
+    /// correct but currently lose to the tuned per-token matvec (scalar dequant +
+    /// strided token-major reads), so generation keeps their per-token prefill
+    /// until a tiled mul_mm kernel lands. This is the gate generation uses.
+    pub fn batched_prefill_worthwhile(&self) -> bool {
+        self.supports_batched_prefill()
+            && self.all_projections(|w| w.mlx.is_some() || w.dtype == DType::BF16)
     }
 
     /// Batched prompt prefill: run all `s` tokens (positions `0..s`) through one
