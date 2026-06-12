@@ -882,13 +882,16 @@ impl LlamaModel {
         };
 
         // Prefill: read each weight once for the whole prompt instead of
-        // token-by-token. The GPU uses the batched Metal matmul (BF16 / MLX
-        // dense models); the CPU Llama family uses the batched forward. Gemma and
-        // quantized / MoE GPU models fall back to the per-token route.
+        // token-by-token. The GPU uses the batched Metal matmul (BF16 / MLX /
+        // Q4_K / Q6_K dense models); the CPU Llama family uses the batched
+        // forward. MoE GPU models fall back to the per-token route. Short prompts
+        // skip the GPU batch — its read-once win only pays off past a few dozen
+        // tokens, and below that per-token is already a few ms.
+        const GPU_BATCH_PREFILL_MIN: usize = 64;
         if !prompt.is_empty() {
             let take = prompt.len().min(self.config.n_ctx);
             let did_batch = if let Some(gpu) = self.gpu.as_ref() {
-                if gpu.batched_prefill_worthwhile() {
+                if gpu.supports_batched_prefill() && take >= GPU_BATCH_PREFILL_MIN {
                     let n = self.config.n_embd;
                     let mut embeds = Vec::with_capacity(take * n);
                     for &tok in &prompt[..take] {

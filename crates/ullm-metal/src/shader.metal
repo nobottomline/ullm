@@ -601,15 +601,21 @@ kernel void matmul_q4k(
         uint qoff = (si / 2u) * 32u;     // qs byte offset for this sub-block
         bool low = (si & 1u) == 0u;      // even sub-block = low nibble
         uint col = b * 256u + si * 32u;  // first activation column
+        // Dequantize the 32 weights ONCE into registers, then sweep each token
+        // column with 32 consecutive activation reads (better x locality).
+        float wv[32];
         for (uint l = 0; l < 32u; ++l) {
             uchar qb = qs[qoff + l];
             float q = low ? (float)(qb & 0xF) : (float)(qb >> 4);
-            float wv = dscale * q - dm;
-            uint c = col + l;
-            for (uint t = 0; t < T; ++t) {
-                uint s = col0 + t;
-                if (s < n_cols) acc[t] += wv * x[s * in_dim + c];
-            }
+            wv[l] = dscale * q - dm;
+        }
+        for (uint t = 0; t < T; ++t) {
+            uint s = col0 + t;
+            if (s >= n_cols) break;
+            device const float* xr = x + s * in_dim + col;
+            float a = 0.f;
+            for (uint l = 0; l < 32u; ++l) a += wv[l] * xr[l];
+            acc[t] += a;
         }
     }
     for (uint t = 0; t < T; ++t) {
@@ -619,8 +625,11 @@ kernel void matmul_q4k(
     }
 }
 
-// Batched Q6_K matmul (prompt prefill): mirrors matvec_q6k; block-per-lane,
-// dequantized once and reused across the T-column tile, reduced with simd_sum.
+// Batched Q6_K matmul (prompt prefill): the row's 16-weight sub-blocks (16 per
+// 256-block, one signed scale each) are spread one-per-lane for full 32-lane
+// occupancy; each lane dequantizes its 16 weights ONCE into registers, then
+// sweeps the T token columns with 16 consecutive activation reads. Mirrors
+// matvec_q6k's ql/qh bit layout; reduced with simd_sum.
 kernel void matmul_q6k(
     device const uchar* w       [[buffer(0)]],
     device const float* x       [[buffer(1)]],
@@ -638,37 +647,38 @@ kernel void matmul_q6k(
     uint col0 = (uint)tgpig.y * T;
     if (o >= out_dim) return;
     uint blocks = in_dim / 256u;
+    uint subs = blocks * 16u; // 16-weight sub-blocks in this row
     device const uchar* row = w + (uint)o * blocks * 210u;
     float acc[T] = { 0.f, 0.f, 0.f, 0.f };
-    for (uint b = tiisg; b < blocks; b += 32u) {
+    for (uint sb = tiisg; sb < subs; sb += 32u) {
+        uint b = sb / 16u, k = sb % 16u;       // block, scale index 0..15
         device const uchar* blk = row + b * 210u;
         device const uchar* ql = blk;
         device const uchar* qh = blk + 128;
         device const char*  sc = (device const char*)(blk + 192);
         float d = (float)as_type<half>((ushort)(blk[208] | (blk[209] << 8)));
-        uint xbase = b * 256u;
-        for (uint nh = 0; nh < 2; ++nh) {
-            uint qlo = nh*64u, qho = nh*32u, sco = nh*8u, yo = nh*128u;
-            for (uint l = 0; l < 32; ++l) {
-                uint is = l / 16u;
-                int q1 = (int)((ql[qlo+l]    & 0xF) | ((int)(qh[qho+l]       & 3) << 4)) - 32;
-                int q2 = (int)((ql[qlo+l+32] & 0xF) | ((int)((qh[qho+l] >> 2) & 3) << 4)) - 32;
-                int q3 = (int)((ql[qlo+l]    >> 4) | ((int)((qh[qho+l] >> 4) & 3) << 4)) - 32;
-                int q4 = (int)((ql[qlo+l+32] >> 4) | ((int)((qh[qho+l] >> 6) & 3) << 4)) - 32;
-                float w1 = d * (float)sc[sco+is]   * (float)q1;
-                float w2 = d * (float)sc[sco+is+2] * (float)q2;
-                float w3 = d * (float)sc[sco+is+4] * (float)q3;
-                float w4 = d * (float)sc[sco+is+6] * (float)q4;
-                uint c1 = xbase + yo + l;
-                for (uint t = 0; t < T; ++t) {
-                    uint s = col0 + t;
-                    if (s < n_cols) {
-                        device const float* xr = x + s * in_dim;
-                        acc[t] += w1 * xr[c1] + w2 * xr[c1 + 32]
-                                + w3 * xr[c1 + 64] + w4 * xr[c1 + 96];
-                    }
-                }
-            }
+        uint nh = k / 8u, rem = k % 8u, g = rem / 2u, is = rem % 2u;
+        uint qlo = nh * 64u, qho = nh * 32u;
+        uint ql_off = (g & 1u) * 32u;          // q2/q4 read the +32 half
+        bool hi = g >= 2u;                      // q3/q4 use the high nibble
+        uint qhs = g * 2u;                      // qh bit pair for this group
+        float sk = d * (float)sc[k];
+        uint base = b * 256u + nh * 128u + g * 32u + is * 16u;
+        float wv[16];
+        for (uint ll = 0; ll < 16u; ++ll) {
+            uint idx = is * 16u + ll;
+            uchar qlb = ql[qlo + idx + ql_off];
+            uint qn = hi ? (uint)(qlb >> 4) : (uint)(qlb & 0xF);
+            uint qhb = ((uint)qh[qho + idx] >> qhs) & 3u;
+            wv[ll] = sk * (float)((int)(qn | (qhb << 4)) - 32);
+        }
+        for (uint t = 0; t < T; ++t) {
+            uint s = col0 + t;
+            if (s >= n_cols) break;
+            device const float* xr = x + s * in_dim + base;
+            float a = 0.f;
+            for (uint ll = 0; ll < 16u; ++ll) a += wv[ll] * xr[ll];
+            acc[t] += a;
         }
     }
     for (uint t = 0; t < T; ++t) {

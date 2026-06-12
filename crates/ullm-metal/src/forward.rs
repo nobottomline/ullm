@@ -729,17 +729,6 @@ impl GpuForward {
             })
     }
 
-    /// Whether batched prefill is also *faster* than per-token for this model —
-    /// true only for BF16 / MLX dense, where per-token decode is memory-bound so
-    /// the read-once batched matmul wins ~4x. The k-quant batched kernels are
-    /// correct but currently lose to the tuned per-token matvec (scalar dequant +
-    /// strided token-major reads), so generation keeps their per-token prefill
-    /// until a tiled mul_mm kernel lands. This is the gate generation uses.
-    pub fn batched_prefill_worthwhile(&self) -> bool {
-        self.supports_batched_prefill()
-            && self.all_projections(|w| w.mlx.is_some() || w.dtype == DType::BF16)
-    }
-
     /// Batched prompt prefill: run all `s` tokens (positions `0..s`) through one
     /// forward pass, reading each weight ONCE via batched matmul, filling the KV
     /// cache for positions `0..s`, and returning the LAST token's logits.
