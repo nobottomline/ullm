@@ -248,6 +248,127 @@ impl Walk<'_> {
     }
 }
 
+/// "Transition not computed yet" sentinel for the transition table.
+const UNKNOWN: u32 = u32::MAX - 1;
+
+/// The fast, persistent matcher used during generation: a lazily-built DFA over
+/// the grammar (distinct stack-sets interned to state ids; `(state, byte)`
+/// transitions cached in a flat table) plus a **per-state allowed-mask cache**.
+///
+/// Unlike [`GrammarState`], everything is reused across decode steps. The big win
+/// is the mask cache: a permissive state (e.g. the interior of a string) recurs
+/// for many tokens in a row, so only the *first* token there pays the trie walk
+/// — the rest read the cached mask in O(vocab).
+pub struct GrammarDfa<'a> {
+    grammar: &'a Grammar,
+    trie: &'a TokenTrie,
+    states: Vec<Vec<Stack>>,
+    ids: std::collections::HashMap<Vec<Stack>, u32>,
+    trans: Vec<Vec<u32>>,
+    masks: Vec<Option<Vec<bool>>>,
+    current: u32,
+}
+
+impl<'a> GrammarDfa<'a> {
+    /// Start at the grammar's root, bound to `trie` (the vocabulary).
+    pub fn new(grammar: &'a Grammar, trie: &'a TokenTrie) -> Self {
+        let init = grammar.initial();
+        let mut ids = std::collections::HashMap::new();
+        ids.insert(init.clone(), 0u32);
+        GrammarDfa {
+            grammar,
+            trie,
+            states: vec![init],
+            ids,
+            trans: Vec::new(),
+            masks: Vec::new(),
+            current: 0,
+        }
+    }
+
+    fn intern(&mut self, s: Vec<Stack>) -> u32 {
+        if let Some(&id) = self.ids.get(&s) {
+            return id;
+        }
+        let id = self.states.len() as u32;
+        self.states.push(s.clone());
+        self.ids.insert(s, id);
+        id
+    }
+
+    /// The state after consuming byte `b` from state `id` (cached forever);
+    /// `DEAD` means the byte is rejected.
+    fn transition(&mut self, id: u32, b: u8) -> u32 {
+        while self.trans.len() <= id as usize {
+            self.trans.push(vec![UNKNOWN; 256]);
+        }
+        let cached = self.trans[id as usize][b as usize];
+        if cached != UNKNOWN {
+            return cached;
+        }
+        let next = self.grammar.accept_byte(&self.states[id as usize], b);
+        let r = if next.is_empty() {
+            DEAD
+        } else {
+            self.intern(next)
+        };
+        self.trans[id as usize][b as usize] = r;
+        r
+    }
+
+    fn descend(&mut self, trie: &TokenTrie, node: usize, id: u32, mask: &mut [bool]) {
+        let n = trie.node(node);
+        for &tid in &n.tokens {
+            mask[tid as usize] = true;
+        }
+        for &(byte, child) in &n.children {
+            let nid = self.transition(id, byte);
+            if nid != DEAD {
+                self.descend(trie, child as usize, nid, mask);
+            }
+        }
+    }
+
+    /// The allowed-token mask for the current state — computed by a trie walk the
+    /// first time the state is seen, then served from cache.
+    pub fn allowed_mask(&mut self) -> &[bool] {
+        let id = self.current as usize;
+        if self.masks.get(id).map(Option::is_none).unwrap_or(true) {
+            let mut mask = vec![false; self.trie.vocab_size()];
+            let trie = self.trie;
+            self.descend(trie, 0, self.current, &mut mask);
+            while self.masks.len() <= id {
+                self.masks.push(None);
+            }
+            self.masks[id] = Some(mask);
+        }
+        self.masks[id].as_deref().unwrap()
+    }
+
+    /// Whether the grammar may terminate now (so EOS is allowed).
+    pub fn can_end(&self) -> bool {
+        self.states[self.current as usize]
+            .iter()
+            .any(|s| s.is_empty())
+    }
+
+    /// Advance by a chosen token's bytes. Returns `false` (state unchanged) if the
+    /// token would leave the grammar — impossible for a token that was allowed.
+    pub fn accept(&mut self, token: u32) -> bool {
+        let trie = self.trie;
+        let piece = trie.piece(token);
+        let mut id = self.current;
+        for &b in piece {
+            id = self.transition(id, b);
+            if id == DEAD {
+                return false;
+            }
+        }
+        self.current = id;
+        true
+    }
+}
+
 /// The live matcher for one generation: the current automaton state plus the
 /// methods a sampler needs (which tokens are allowed, may we stop, advance).
 pub struct GrammarState<'g> {
@@ -372,6 +493,35 @@ mod tests {
 
     fn pieces_for(s: &[&str]) -> Vec<Vec<u8>> {
         s.iter().map(|t| t.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn dfa_mask_equals_naive_and_caches() {
+        let pieces = pieces_for(&[
+            "{", "}", "\"", "\"a", "\"ab", "true", "1", "12", ":", ",", " ",
+        ]);
+        let trie = TokenTrie::new(pieces.clone());
+        let g = Grammar::json();
+        let mut dfa = GrammarDfa::new(&g, &trie);
+        // Drive a real object and check the DFA mask matches the naive mask at
+        // every step, and that EOS-ability agrees.
+        let steps: &[&[u8]] = &[b"{", b"\"a", b"\"", b":", b"1", b"}"];
+        let mut st = GrammarState::new(&g);
+        for step in steps {
+            let mut naive = vec![false; pieces.len()];
+            st.allowed_mask(&pieces, &mut naive);
+            assert_eq!(
+                dfa.allowed_mask(),
+                naive.as_slice(),
+                "DFA mask must match naive"
+            );
+            assert_eq!(dfa.can_end(), st.can_end());
+            // advance both by this token (find its id)
+            let id = pieces.iter().position(|p| p == step).unwrap() as u32;
+            assert!(dfa.accept(id));
+            assert!(st.accept_token(step));
+        }
+        assert!(dfa.can_end(), "a complete object can terminate");
     }
 
     #[test]

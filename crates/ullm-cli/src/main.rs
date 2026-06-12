@@ -8,7 +8,9 @@ use ullm_core::device::Hardware;
 use ullm_core::ir::WeightSource;
 use ullm_gguf::GgufModel;
 use ullm_metal::MetalContext;
-use ullm_model::{Grammar, GrammarConstraint, GrammarState, LlamaModel, SampleParams, TokenTrie};
+use ullm_model::{
+    Grammar, GrammarConstraint, GrammarDfa, GrammarState, LlamaModel, SampleParams, TokenTrie,
+};
 use ullm_safetensors::SafeTensorsModel;
 
 #[derive(Parser)]
@@ -158,8 +160,10 @@ fn main() {
     }
 }
 
-/// Time grammar masking with the naive O(vocab) path vs the token-trie path, at
-/// a permissive state (inside a JSON string, where most tokens are valid).
+/// Time the per-token grammar cost (mask + apply to logits) three ways — naive
+/// O(vocab), one-shot token-trie walk, and the persistent DFA with its per-state
+/// mask cache (cold first hit vs warm) — at a structural state and inside an
+/// (almost everything allowed) JSON string.
 fn grammar_bench(path: &Path) {
     let tk = if is_safetensors(path) {
         load_hf_tokenizer(path)
@@ -178,6 +182,19 @@ fn grammar_bench(path: &Path) {
     let grammar = Grammar::json();
     println!("grammar-bench: {path:?}  (vocab {})", pieces.len());
 
+    // A token whose piece is a literal double-quote, to step into a JSON string.
+    let quote = pieces.iter().position(|p| p == b"\"").map(|i| i as u32);
+
+    // The real per-token cost is "produce the mask, then apply it to the logits".
+    // Apply into a dummy logit buffer (and read it back) so nothing is elided.
+    let mut logits = vec![0.0f32; pieces.len()];
+    let apply = |mask: &[bool], logits: &mut [f32]| -> f32 {
+        for (l, &ok) in logits.iter_mut().zip(mask) {
+            *l = if ok { 0.0 } else { f32::NEG_INFINITY };
+        }
+        logits.iter().filter(|x| x.is_finite()).count() as f32
+    };
+
     let iters = 200u32;
     for (label, steps) in [
         ("root", Vec::new()),
@@ -188,23 +205,48 @@ fn grammar_bench(path: &Path) {
             st.accept_token(s);
         }
         let mut mask = vec![false; pieces.len()];
+        let mut sink = 0.0f32;
 
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             st.allowed_mask(&pieces, &mut mask);
+            sink += apply(&mask, &mut logits);
         }
         let naive_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
 
         let t1 = std::time::Instant::now();
         for _ in 0..iters {
             st.allowed_mask_trie(&trie, &mut mask);
+            sink += apply(&mask, &mut logits);
         }
         let trie_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
 
+        // Persistent DFA positioned at the same state: cold (first call walks the
+        // trie) vs warm (per-state mask cached; only the logit apply remains).
+        let mut dfa = GrammarDfa::new(&grammar, &trie);
+        if !steps.is_empty() {
+            if let Some(q) = quote {
+                dfa.accept(q);
+            }
+        }
+        let c0 = std::time::Instant::now();
+        sink += apply(dfa.allowed_mask(), &mut logits);
+        let dfa_cold_us = c0.elapsed().as_secs_f64() * 1e6;
+        let w0 = std::time::Instant::now();
+        for _ in 0..iters {
+            sink += apply(dfa.allowed_mask(), &mut logits);
+        }
+        let dfa_warm_us = w0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
         let allowed = mask.iter().filter(|b| **b).count();
+        println!("  [{label}] {allowed} tokens allowed  (checksum {sink:.0})");
         println!(
-            "  [{label}] {allowed} tokens allowed  ·  naive {naive_us:.0} µs  ·  trie {trie_us:.1} µs  ·  {:.1}x faster",
-            naive_us / trie_us.max(1e-9)
+            "      mask+apply per token:  naive {naive_us:.0} µs · per-call trie {trie_us:.1} µs · DFA cold {dfa_cold_us:.1} µs · DFA warm {dfa_warm_us:.1} µs"
+        );
+        println!(
+            "      warm DFA is {:.0}x faster than naive, {:.1}x faster than per-call trie",
+            naive_us / dfa_warm_us.max(1e-9),
+            trie_us / dfa_warm_us.max(1e-9)
         );
     }
 }

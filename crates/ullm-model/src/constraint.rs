@@ -5,7 +5,7 @@
 //! they can never be chosen. The output is structurally valid by construction —
 //! no retries, no JSON-repair.
 
-use ullm_grammar::{Grammar, GrammarState, TokenTrie};
+use ullm_grammar::{Grammar, GrammarDfa, TokenTrie};
 
 /// A constraint applied to the logits in place before sampling.
 pub trait LogitConstraint {
@@ -15,14 +15,12 @@ pub trait LogitConstraint {
     fn accept(&mut self, token: u32);
 }
 
-/// A [`LogitConstraint`] driven by a GBNF [`Grammar`]: it holds the live matcher,
-/// a prebuilt [`TokenTrie`] over the vocabulary (for fast masking), and the EOS
-/// id (allowed only when the grammar may legally terminate).
+/// A [`LogitConstraint`] driven by a GBNF [`Grammar`]. It owns a [`GrammarDfa`]
+/// (a persistent matcher with per-state mask caching, built over a prebuilt
+/// [`TokenTrie`]) and the EOS id (allowed only when the grammar may terminate).
 pub struct GrammarConstraint<'a> {
-    state: GrammarState<'a>,
-    trie: &'a TokenTrie,
+    dfa: GrammarDfa<'a>,
     eos: Option<u32>,
-    allowed: Vec<bool>,
 }
 
 impl<'a> GrammarConstraint<'a> {
@@ -30,28 +28,26 @@ impl<'a> GrammarConstraint<'a> {
     /// requests; `eos` is the end-of-sequence id, if any.
     pub fn new(grammar: &'a Grammar, trie: &'a TokenTrie, eos: Option<u32>) -> Self {
         Self {
-            state: GrammarState::new(grammar),
-            trie,
+            dfa: GrammarDfa::new(grammar, trie),
             eos,
-            allowed: vec![false; trie.vocab_size()],
         }
     }
 }
 
 impl LogitConstraint for GrammarConstraint<'_> {
     fn constrain(&mut self, logits: &mut [f32]) {
-        self.state.allowed_mask_trie(self.trie, &mut self.allowed);
-        let can_end = self.state.can_end();
+        let can_end = self.dfa.can_end();
+        let eos = self.eos;
+        let allowed = self.dfa.allowed_mask();
         for (i, l) in logits.iter_mut().enumerate() {
-            let ok = self.allowed.get(i).copied().unwrap_or(false)
-                || (can_end && self.eos == Some(i as u32));
+            let ok = allowed.get(i).copied().unwrap_or(false) || (can_end && eos == Some(i as u32));
             if !ok {
                 *l = f32::NEG_INFINITY;
             }
         }
         // Never hand the sampler an all -inf distribution: if the grammar is
         // stuck, fall back to stopping cleanly on EOS.
-        if let Some(eos) = self.eos {
+        if let Some(eos) = eos {
             if logits.iter().all(|l| !l.is_finite()) {
                 logits[eos as usize] = 0.0;
             }
@@ -59,9 +55,6 @@ impl LogitConstraint for GrammarConstraint<'_> {
     }
 
     fn accept(&mut self, token: u32) {
-        let piece = self.trie.piece(token);
-        if !piece.is_empty() {
-            self.state.accept_token(piece);
-        }
+        self.dfa.accept(token);
     }
 }

@@ -39,20 +39,26 @@ are kept resident and dequantized in-kernel. Optimization path (decode t/s):
 ## Grammar masking (structured output)
 
 Constrained decoding adds a per-token step: mask every token the grammar can't
-accept. The naive mask simulates each token separately (O(vocab)); the token
-trie walks the vocabulary once, interning grammar states and memoizing
-`(state, byte)` transitions. Measured with `ullm grammar-bench`, Qwen3-4B
-tokenizer (vocab 151 669), JSON grammar, Apple M4 Max:
+accept. Three implementations, each `mask + apply to logits`, measured with
+`ullm grammar-bench` on the Qwen3-4B tokenizer (vocab 151 669), JSON grammar,
+Apple M4 Max:
 
-| Grammar state | tokens allowed | naive | token trie | speedup |
-|---------------|---------------:|------:|-----------:|--------:|
-| structural (at `root`) | 1 062 | ~95 ms | **~0.18 ms** | ~550× |
-| inside an open string | 150 331 | ~260 ms | **~7 ms** | ~35× |
+- **naive** — simulate every token's bytes through the grammar separately, O(vocab).
+- **token trie** — one walk over a byte trie of the vocabulary, interning grammar
+  states and memoizing `(state, byte)` transitions within the call.
+- **persistent DFA** (`GrammarDfa`, the one used in generation) — the trie walk
+  plus a per-state mask cache reused across decode steps: the first time a state
+  is seen it pays the walk (cold), every later token in that state is free (warm).
 
-Structural states (the bulk of a typical JSON/tool-call generation) cost well
-under a millisecond; the worst case — an unconstrained string interior where
-almost every token is legal — is the floor, bounded by having to mark each
-allowed token.
+| Grammar state | tokens allowed | naive | per-call trie | DFA cold | **DFA warm** |
+|---------------|---------------:|------:|--------------:|---------:|-------------:|
+| structural (`root`) | 1 062 | ~108 ms | ~0.17 ms | ~0.18 ms | **~34 µs** |
+| inside an open string | 150 331 | ~316 ms | ~8 ms | ~5.7 ms | **~34 µs** |
+
+A recurring grammar state (a string interior, or a structural point hit every
+object) costs the trie walk *once*; after that the per-token overhead is a flat
+~34 µs — just writing the cached mask onto the logits — i.e. ~0.2 % of a 60 tok/s
+decode step. The grammar guarantee is effectively free per token.
 
 ## Prefill (prompt processing)
 

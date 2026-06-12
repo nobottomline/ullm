@@ -49,13 +49,17 @@ level, so invalid output is impossible — on any format, on CPU and GPU.
   arguments: <params schema>}`, reusing the schema compiler); returns OpenAI
   `tool_calls`. Validated on Qwen3-4B: right tool picked, arguments conform to
   the function schema; forced `tool_choice` and unknown-function 400 both work
-- ☑ Token-trie acceleration — one trie walk over the vocabulary, with
-  stack-set interning + memoized `(state, byte)` transitions, replaces the naive
-  O(vocab) per-token mask. On Qwen3-4B (vocab 151 669): **~180 µs at structural
-  states (≈550×)** and ~7 ms inside an open string (≈35×). Measure it with
-  `ullm grammar-bench <model>`
+- ☑ Token-trie acceleration — one trie walk over the vocabulary (shared
+  prefixes; a rejected byte prunes the whole subtree) replaces the naive
+  O(vocab) per-token mask
+- ☑ Persistent DFA + per-state mask cache (`GrammarDfa`) — stack-sets are
+  interned to ids, `(state, byte)` transitions cached in a flat table, and the
+  **whole allowed-mask is memoized per state**, all reused across decode steps.
+  A recurring state (string interior, structural points) is computed once, then
+  free. On Qwen3-4B (vocab 151 669) the per-token grammar cost drops to a flat
+  **~34 µs** (just applying the cached mask): ~3 200× over naive at structural
+  states, ~9 200× inside an open string. `ullm grammar-bench <model>`
 - ☐ Streaming `tool_calls` deltas (tool calls are non-streamed today)
-- ☐ Cross-step DFA cache (reuse the interned transition table between tokens)
 - ☐ Regex-constrained decoding (a regex → NFA path); string `pattern`/`format`
 - ☐ Schema `$ref`/`$defs`, `additionalProperties` schema, `maxItems`
 
