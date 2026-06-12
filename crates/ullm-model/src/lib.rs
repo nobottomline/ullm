@@ -9,6 +9,7 @@
 
 mod config;
 mod constraint;
+mod deltanet;
 mod math;
 mod mlx;
 mod sample;

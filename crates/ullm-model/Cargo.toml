@@ -15,3 +15,6 @@ ullm-safetensors = { workspace = true }
 ullm-metal = { workspace = true }
 ullm-grammar = { workspace = true }
 rayon = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
