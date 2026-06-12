@@ -1,9 +1,11 @@
-//! A correctness-first CPU runtime for the Llama architecture.
+//! A correctness-first CPU runtime for the Llama family — Llama 2/3, Qwen2,
+//! Qwen3, Qwen3-MoE and Gemma-3 — loaded from GGUF, SafeTensors or MLX.
 //!
-//! Weights stay in their quantized GGUF form and are dequantized one row at a
-//! time during each matmul (in parallel over rows), so the model uses ~4-7x less
+//! Weights stay in their quantized form and are dequantized one row at a time
+//! during each matmul (in parallel over rows), so the model uses ~4-7x less
 //! memory than f32 and starts with no up-front dequantization. It remains the
-//! numerical reference the Metal backend is validated against.
+//! numerical reference the Metal backend is validated against, and hosts the
+//! sampling loop and grammar-constraint hook (see [`constraint`]).
 
 mod config;
 mod constraint;

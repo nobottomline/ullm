@@ -128,9 +128,8 @@ pub(crate) fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize,
     }
 }
 
-/// NeoX / "rotate-half" RoPE: rotates `(x[i], x[i+d/2])`. Kept for architectures
-/// whose GGUF weights are not permuted into the interleaved layout.
-#[allow(dead_code)]
+/// NeoX / "rotate-half" RoPE: rotates `(x[i], x[i+d/2])`. Used for Gemma and for
+/// HF/SafeTensors weights, which are not permuted into the interleaved layout.
 pub(crate) fn rope_neox(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
     let half = head_dim / 2;
     for h in 0..n_heads {

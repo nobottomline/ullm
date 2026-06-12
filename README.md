@@ -1,5 +1,9 @@
 # uLLM
 
+[![CI](https://github.com/nobottomline/ullm/actions/workflows/ci.yml/badge.svg)](https://github.com/nobottomline/ullm/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](rust-toolchain.toml)
+
 **The local inference engine for agents — where the model has to obey.**
 
 Bring any model you already have — GGUF, Hugging Face, or Apple MLX — and get
@@ -7,10 +11,11 @@ output that is *guaranteed* to match a schema, a grammar, or a regex. Valid JSON
 every time, a tool call that is always well-formed, an answer from a fixed set —
 with no retries and no JSON-repair. Pure Rust, Apple-Silicon-first, embeddable.
 
-> **Status: Phase 1, single-Mac.** Runs real models end-to-end on the Metal GPU
-> — GGUF, SafeTensors (Hugging Face), and Apple MLX — including a 30B
-> mixture-of-experts, with grammar-constrained decoding on every format.
-> See [why uLLM exists](docs/strategy/positioning.md) and the
+> **Status: single-Mac, structured output complete.** Runs real models
+> end-to-end on the Metal GPU — GGUF, SafeTensors (Hugging Face), and Apple MLX,
+> including a 30B mixture-of-experts — with guaranteed grammar / JSON-Schema /
+> regex-constrained decoding on every format. See
+> [why uLLM exists](docs/strategy/positioning.md) and the
 > [roadmap](docs/roadmap.md).
 
 ---
@@ -51,9 +56,9 @@ Single-stream decode on an Apple M4 Max (full numbers + how to reproduce in
 |-------|--------|---------:|
 | Llama-3.2-1B | GGUF Q4_K_M | 263 tok/s |
 | Qwen2.5-1.5B | GGUF Q4_K_M | 190 tok/s |
-| gemma-3-4b | GGUF Q6_K | 80 tok/s |
-| Qwen3-4B | HF BF16 | 27 tok/s |
-| Qwen3-Coder-30B-A3B | MLX 4-bit (MoE) | 23 tok/s |
+| gemma-3-4b | GGUF Q6_K | 80.5 tok/s |
+| Qwen3-4B | HF BF16 | 26.6 tok/s |
+| Qwen3-Coder-30B-A3B | MLX 4-bit (MoE) | 63.6 tok/s |
 
 ## Quickstart
 

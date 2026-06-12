@@ -259,25 +259,7 @@ fn grammar_bench(path: &Path) {
 /// Run a prompt through the batched prefill and the token-by-token CPU forward
 /// and confirm the final-position logits match (max abs diff + argmax agree).
 fn prefill_check(path: &Path, prompt: &str) {
-    let exit = |e| -> ! {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    };
-    let (tk, mut lm) = if is_safetensors(path) {
-        let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
-        let tk = load_hf_tokenizer(path);
-        // MLX models carry a `quantization` block in config.json.
-        let lm = if st.config().get("quantization").is_some() {
-            LlamaModel::from_mlx(&st).unwrap_or_else(|e| exit(e))
-        } else {
-            LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e))
-        };
-        (tk, lm)
-    } else {
-        let m = GgufModel::open(path).unwrap_or_else(|e| exit(e));
-        let tk = m.tokenizer().unwrap_or_else(|e| exit(e));
-        (tk, LlamaModel::from_gguf(&m).unwrap_or_else(|e| exit(e)))
-    };
+    let (tk, mut lm) = load_model(path, false);
     let ids = tk.encode(prompt, true);
     let r = lm.prefill_check(&ids);
 
@@ -313,30 +295,8 @@ fn prefill_check(path: &Path, prompt: &str) {
 /// Run a prompt through the CPU and GPU forward passes and compare the logits at
 /// the final position (max abs diff + whether the argmax token agrees).
 fn gpu_check(path: &Path, prompt: &str) {
-    let exit = |e| -> ! {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    };
-    let load = |gpu: bool| -> (ullm_tokenizer::Tokenizer, LlamaModel) {
-        let (tk, mut lm) = if is_safetensors(path) {
-            let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
-            (
-                load_hf_tokenizer(path),
-                LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e)),
-            )
-        } else {
-            let m = GgufModel::open(path).unwrap_or_else(|e| exit(e));
-            let tk = m.tokenizer().unwrap_or_else(|e| exit(e));
-            (tk, LlamaModel::from_gguf(&m).unwrap_or_else(|e| exit(e)))
-        };
-        if gpu {
-            lm.enable_gpu().unwrap_or_else(|e| exit(e));
-        }
-        (tk, lm)
-    };
-
-    let (tk, mut cpu) = load(false);
-    let (_, mut gpu) = load(true);
+    let (tk, mut cpu) = load_model(path, false);
+    let (_, mut gpu) = load_model(path, true);
     let ids = tk.encode(prompt, true);
 
     if std::env::var("ULLM_GPU_DBG").is_ok() {
@@ -596,6 +556,37 @@ fn tokenize(path: &Path, text: &str) {
     println!("decoded:  {:?}", tk.decode(&ids));
 }
 
+/// Print an error and exit (CLI-level fatal error).
+fn die(e: impl std::fmt::Display) -> ! {
+    eprintln!("error: {e}");
+    std::process::exit(1);
+}
+
+/// Load a model + tokenizer from a GGUF file or an HF/MLX directory, optionally
+/// moving the forward pass onto the Metal GPU. The single loading path shared by
+/// `run`, `gpu-check` and `prefill-check`.
+fn load_model(path: &Path, gpu: bool) -> (ullm_tokenizer::Tokenizer, LlamaModel) {
+    let (tk, mut lm) = if is_safetensors(path) {
+        let st = SafeTensorsModel::open(path).unwrap_or_else(|e| die(e));
+        let tk = load_hf_tokenizer(path);
+        // MLX models carry a `quantization` block in config.json.
+        let lm = if st.config().get("quantization").is_some() {
+            LlamaModel::from_mlx(&st).unwrap_or_else(|e| die(e))
+        } else {
+            LlamaModel::from_safetensors(&st).unwrap_or_else(|e| die(e))
+        };
+        (tk, lm) // `st`'s mmap drops here; `lm` owns copied weights
+    } else {
+        let model = GgufModel::open(path).unwrap_or_else(|e| die(e));
+        let tk = model.tokenizer().unwrap_or_else(|e| die(e));
+        (tk, LlamaModel::from_gguf(&model).unwrap_or_else(|e| die(e)))
+    };
+    if gpu {
+        lm.enable_gpu().unwrap_or_else(|e| die(e));
+    }
+    (tk, lm)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     path: &Path,
@@ -608,30 +599,8 @@ fn run(
     regex: Option<&str>,
     json: bool,
 ) {
-    let exit = |e| -> ! {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    };
     let t_load = std::time::Instant::now();
-    let (tk, mut lm) = if is_safetensors(path) {
-        let st = SafeTensorsModel::open(path).unwrap_or_else(|e| exit(e));
-        let tk = load_hf_tokenizer(path);
-        // MLX models carry a `quantization` block in config.json.
-        let lm = if st.config().get("quantization").is_some() {
-            LlamaModel::from_mlx(&st).unwrap_or_else(|e| exit(e))
-        } else {
-            LlamaModel::from_safetensors(&st).unwrap_or_else(|e| exit(e))
-        };
-        (tk, lm) // `st`'s mmap drops here; `lm` owns copied weights
-    } else {
-        let model = GgufModel::open(path).unwrap_or_else(|e| exit(e));
-        let tk = model.tokenizer().unwrap_or_else(|e| exit(e));
-        let lm = LlamaModel::from_gguf(&model).unwrap_or_else(|e| exit(e));
-        (tk, lm)
-    };
-    if gpu {
-        lm.enable_gpu().unwrap_or_else(|e| exit(e));
-    }
+    let (tk, mut lm) = load_model(path, gpu);
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     let prompt_ids = tk.encode(prompt, true);
@@ -640,14 +609,14 @@ fn run(
     // `grammar` binding must outlive `constraint`, which borrows it.
     let grammar: Option<Grammar> = match (grammar_file, schema_file, regex, json) {
         (Some(file), ..) => {
-            let text = std::fs::read_to_string(file).unwrap_or_else(|e| exit(e.into()));
-            Some(Grammar::from_gbnf(&text).unwrap_or_else(|e| exit(e)))
+            let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(e));
+            Some(Grammar::from_gbnf(&text).unwrap_or_else(|e| die(e)))
         }
         (None, Some(file), ..) => {
-            let text = std::fs::read_to_string(file).unwrap_or_else(|e| exit(e.into()));
-            Some(Grammar::from_json_schema_str(&text).unwrap_or_else(|e| exit(e)))
+            let text = std::fs::read_to_string(file).unwrap_or_else(|e| die(e));
+            Some(Grammar::from_json_schema_str(&text).unwrap_or_else(|e| die(e)))
         }
-        (None, None, Some(re), _) => Some(Grammar::from_regex(re).unwrap_or_else(|e| exit(e))),
+        (None, None, Some(re), _) => Some(Grammar::from_regex(re).unwrap_or_else(|e| die(e))),
         (None, None, None, true) => Some(Grammar::json()),
         (None, None, None, false) => None,
     };
