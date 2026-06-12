@@ -68,19 +68,21 @@ token. On the GPU the batched kernels (`matmul_bf16` / `matmul_mlx4` /
 `matmul_q4k` / `matmul_q6k`) write K/V straight into the cache and project only
 the last token's logits. Numerically identical to the token-by-token path —
 verify with `ullm prefill-check <model> --gpu` (max |Δlogit| ≤ 6e-5, argmax
-agrees). Measured GPU prefill of a 508-token prompt, Apple M-series:
+agrees). `prefill-check --gpu` of a 508-token prompt, Apple M-series (both paths
+timed in the same run):
 
 | Model | Quant | token-by-token | batched | speedup |
 |-------|-------|---------------:|--------:|--------:|
 | Qwen3-4B-Instruct (dense) | BF16 | 17.1 s | 4.2 s | **4.07×** |
-| Qwen2.5-1.5B (dense) | Q4_K_M | 3.45 s | 1.96 s | **1.76×** |
+| Qwen2.5-1.5B (dense) | Q4_K_M | 3.45 s | 2.25 s | **1.53×** |
 | gemma-3-4b (dense) | Q6_K | 6.6 s | 4.3 s | **1.53×** |
 
 BF16 wins most: per-token decode is memory-bound, so reading each weight once
 across the batch is a near-4× cut in weight traffic. The k-quants win less — the
 per-token matvec is already heavily tuned, so the batched kernel only pulls ahead
 once its read-once + dequant-once amortization (sub-block-per-lane, weights
-dequantized into registers and reused across the column tile) beats that. Short
+dequantized into registers and reused across the column tile, 8 token columns per
+weight read) beats that. Short
 prompts (< 64 tokens) stay on the per-token path, where prefill is already a few
 ms. MoE models also stay per-token (experts are routed per token). The CPU path
 batches too (Llama family), via the same read-once `matmul_q`.
