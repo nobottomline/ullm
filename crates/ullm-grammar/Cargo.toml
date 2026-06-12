@@ -10,3 +10,4 @@ description = "GBNF grammar-constrained decoding for uLLM: guaranteed-valid stru
 
 [dependencies]
 ullm-core.workspace = true
+serde_json.workspace = true

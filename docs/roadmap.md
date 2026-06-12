@@ -35,10 +35,14 @@ level, so invalid output is impossible — on any format, on CPU and GPU.
 - ☑ GBNF grammar engine (`ullm-grammar`) — byte-level pushdown NFA; parses
   string/class/group/alternation/`*+?`; per-token logit masking. Validated
   guaranteed-valid JSON + custom grammars on GGUF/HF/MLX (`--json`, `--grammar`)
-- ☐ JSON Schema → grammar compiler (typed keys, enums, required, min/maxItems)
+- ☑ JSON Schema → grammar compiler (`--schema`) — object/array/string/integer/
+  number/boolean/null, `properties` + `required` (any-subset optionals), `enum`,
+  `const`, `items` + `minItems`, `anyOf`/`oneOf`. Output validated to conform
+  with the `jsonschema` reference validator on Qwen3-4B
 - ☐ `response_format` / `grammar` field in the OpenAI server + tool-call schemas
 - ☐ Token-trie acceleration for the mask (sub-ms constraint at full vocab)
-- ☐ Regex-constrained decoding (a regex → NFA path)
+- ☐ Regex-constrained decoding (a regex → NFA path); string `pattern`/`format`
+- ☐ Schema `$ref`/`$defs`, `additionalProperties` schema, `maxItems`
 
 ## Phase 2 — Serving & scale
 

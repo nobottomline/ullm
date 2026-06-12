@@ -855,6 +855,7 @@ dependencies = [
 name = "ullm-grammar"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
  "ullm-core",
 ]
 

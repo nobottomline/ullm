@@ -15,6 +15,7 @@
 //! a known limitation (see `docs/`).
 
 mod parser;
+mod schema;
 
 use ullm_core::Result;
 
@@ -79,6 +80,20 @@ impl Grammar {
     /// The built-in JSON grammar: any syntactically valid JSON value.
     pub fn json() -> Grammar {
         Grammar::from_gbnf(JSON_GBNF).expect("built-in JSON grammar is valid")
+    }
+
+    /// Compile a JSON Schema into a grammar that accepts exactly the JSON
+    /// documents it describes (the right keys, types, `enum` values, ...). See
+    /// the `schema` module for the supported keyword subset.
+    pub fn from_json_schema(schema: &serde_json::Value) -> Result<Grammar> {
+        Grammar::from_gbnf(&schema::schema_to_gbnf(schema)?)
+    }
+
+    /// Compile a JSON Schema given as a JSON string.
+    pub fn from_json_schema_str(json: &str) -> Result<Grammar> {
+        let schema: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| ullm_core::Error::Format(format!("JSON Schema: {e}")))?;
+        Grammar::from_json_schema(&schema)
     }
 
     fn elem_at(&self, p: Pos) -> &Elem {

@@ -1,0 +1,11 @@
+{
+  "$comment": "Example JSON Schema for `ullm run --schema`. Output is guaranteed to conform: the right keys, sentiment from the enum, an integer rating, a non-empty array of string tags.",
+  "type": "object",
+  "properties": {
+    "product":   { "type": "string" },
+    "sentiment": { "enum": ["positive", "negative", "neutral"] },
+    "rating":    { "type": "integer" },
+    "tags":      { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+  },
+  "required": ["product", "sentiment", "rating", "tags"]
+}

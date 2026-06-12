@@ -61,6 +61,9 @@ enum Command {
         /// Constrain output to a GBNF grammar file (guaranteed-valid structure).
         #[arg(long, value_name = "FILE")]
         grammar: Option<PathBuf>,
+        /// Constrain output to a JSON Schema file (compiled to a grammar).
+        #[arg(long, value_name = "FILE")]
+        schema: Option<PathBuf>,
         /// Constrain output to valid JSON (shorthand for the built-in grammar).
         #[arg(long)]
         json: bool,
@@ -115,6 +118,7 @@ fn main() {
             seed,
             gpu,
             grammar,
+            schema,
             json,
         } => run(
             &path,
@@ -128,6 +132,7 @@ fn main() {
             },
             gpu,
             grammar.as_deref(),
+            schema.as_deref(),
             json,
         ),
         Command::Serve {
@@ -495,6 +500,7 @@ fn run(
     params: SampleParams,
     gpu: bool,
     grammar_file: Option<&Path>,
+    schema_file: Option<&Path>,
     json: bool,
 ) {
     let exit = |e| -> ! {
@@ -527,13 +533,17 @@ fn run(
 
     // Optional grammar constraint (guaranteed-valid structured output). The
     // `grammar` binding must outlive `constraint`, which borrows it.
-    let grammar: Option<Grammar> = match (grammar_file, json) {
-        (Some(file), _) => {
+    let grammar: Option<Grammar> = match (grammar_file, schema_file, json) {
+        (Some(file), _, _) => {
             let text = std::fs::read_to_string(file).unwrap_or_else(|e| exit(e.into()));
             Some(Grammar::from_gbnf(&text).unwrap_or_else(|e| exit(e)))
         }
-        (None, true) => Some(Grammar::json()),
-        (None, false) => None,
+        (None, Some(file), _) => {
+            let text = std::fs::read_to_string(file).unwrap_or_else(|e| exit(e.into()));
+            Some(Grammar::from_json_schema_str(&text).unwrap_or_else(|e| exit(e)))
+        }
+        (None, None, true) => Some(Grammar::json()),
+        (None, None, false) => None,
     };
     let mut constraint = grammar
         .as_ref()

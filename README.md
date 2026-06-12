@@ -60,6 +60,8 @@ cargo build --release
 
 # Guaranteed structured output — the response is always valid JSON...
 ./target/release/ullm run model.gguf "Extract name and age: John is 30." --json --gpu
+# ...conforming to a JSON Schema (right keys, types, enums — provably valid)...
+./target/release/ullm run model.gguf "Review: great blender, 5 stars." --schema grammars/review.schema.json --gpu
 # ...or constrained to your own grammar (e.g. a fixed label set).
 echo 'root ::= "positive" | "negative" | "neutral"' > sentiment.gbnf
 ./target/release/ullm run model.gguf "Sentiment of 'I loved it'. Answer:" --grammar sentiment.gbnf
