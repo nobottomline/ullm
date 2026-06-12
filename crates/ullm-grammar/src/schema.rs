@@ -9,7 +9,8 @@
 //! machinery. Supported keywords: `type` (object/array/string/integer/number/
 //! boolean/null, or an array of types), `properties`, `required`,
 //! `additionalProperties` (objects are closed unless it is truthy), `items`,
-//! `minItems`, `enum`, `const`, `anyOf`/`oneOf`. Unsupported keywords are
+//! `minItems`, `enum`, `const`, `anyOf`/`oneOf`, and local `$ref` into `$defs` /
+//! `definitions` (including self-recursive schemas). Unsupported keywords are
 //! ignored (the result is a valid superset constraint), and an untyped schema
 //! falls back to "any JSON value".
 
@@ -18,7 +19,10 @@ use ullm_core::{Error, Result};
 
 /// Compile a JSON Schema value into GBNF grammar text.
 pub(crate) fn schema_to_gbnf(schema: &Value) -> Result<String> {
-    let mut c = Compiler::default();
+    let mut c = Compiler {
+        defs: collect_defs(schema),
+        ..Compiler::default()
+    };
     let root = c.visit(schema)?;
     let mut out = format!("root ::= ws {root} ws\n");
     out.push_str("ws ::= [ \\t\\n\\r]*\n");
@@ -30,10 +34,27 @@ pub(crate) fn schema_to_gbnf(schema: &Value) -> Result<String> {
     Ok(out)
 }
 
+/// Gather the named subschemas from `$defs` / `definitions` (both conventions).
+fn collect_defs(schema: &Value) -> serde_json::Map<String, Value> {
+    let mut defs = serde_json::Map::new();
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(m)) = schema.get(key) {
+            for (k, v) in m {
+                defs.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    defs
+}
+
 #[derive(Default)]
 struct Compiler {
     rules: Vec<String>,
     counter: usize,
+    /// Named subschemas (`$defs` / `definitions`) resolvable via `$ref`.
+    defs: serde_json::Map<String, Value>,
+    /// `$ref` target name -> the rule that realizes it (tie-the-knot recursion).
+    ref_rules: std::collections::HashMap<String, String>,
     // Which shared primitives the grammar references.
     need_string: bool,
     need_integer: bool,
@@ -66,6 +87,9 @@ impl Compiler {
             _ => return Ok(self.value()),
         };
 
+        if let Some(Value::String(pointer)) = obj.get("$ref") {
+            return self.visit_ref(pointer);
+        }
         if let Some(c) = obj.get("const") {
             return Ok(self.add(json_literal(c)));
         }
@@ -104,6 +128,25 @@ impl Compiler {
             _ if obj.contains_key("properties") => self.visit_object(obj),
             _ => Ok(self.value()),
         }
+    }
+
+    /// Resolve a local `$ref` (`#/$defs/Name`, `#/definitions/Name`) to a rule.
+    /// The rule name is reserved *before* the target is compiled, so a schema
+    /// that refers to itself (a recursive tree) ties the knot instead of looping.
+    fn visit_ref(&mut self, pointer: &str) -> Result<String> {
+        let name = pointer.rsplit('/').next().unwrap_or(pointer).to_string();
+        if let Some(rule) = self.ref_rules.get(&name) {
+            return Ok(rule.clone());
+        }
+        let rule = self.fresh();
+        self.ref_rules.insert(name.clone(), rule.clone());
+        let def =
+            self.defs.get(&name).cloned().ok_or_else(|| {
+                Error::Unsupported(format!("$ref to unknown definition {name:?}"))
+            })?;
+        let body = self.visit(&def)?;
+        self.rules.push(format!("{rule} ::= {body}"));
+        Ok(rule)
     }
 
     fn visit_type(&mut self, t: &str, obj: &serde_json::Map<String, Value>) -> Result<String> {
@@ -382,6 +425,68 @@ mod tests {
         st.allowed_mask(&ps, &mut mask);
         assert!(!mask[0], "empty array violates minItems:1");
         assert!(mask[1], "a digit is allowed");
+    }
+
+    #[test]
+    fn ref_and_recursive_schema() {
+        // A nested address via $ref...
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "address": {"$ref": "#/$defs/addr"}
+            },
+            "required": ["name", "address"],
+            "$defs": {
+                "addr": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        let g = Grammar::from_json_schema(&schema).unwrap();
+        assert!(run(
+            &g,
+            &[
+                "{",
+                "\"name\"",
+                ":",
+                "\"Jo\"",
+                ",",
+                "\"address\"",
+                ":",
+                "{",
+                "\"city\"",
+                ":",
+                "\"NY\"",
+                "}",
+                "}"
+            ]
+        ));
+
+        // ...and a self-recursive tree (ties the knot, no infinite loop).
+        let tree = json!({
+            "$ref": "#/$defs/node",
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "v": {"type": "integer"},
+                        "kids": {"type": "array", "items": {"$ref": "#/$defs/node"}}
+                    },
+                    "required": ["v"]
+                }
+            }
+        });
+        let g = Grammar::from_json_schema(&tree).unwrap();
+        assert!(run(
+            &g,
+            &[
+                "{", "\"v\"", ":", "1", ",", "\"kids\"", ":", "[", "{", "\"v\"", ":", "2", "}",
+                "]", "}"
+            ]
+        ));
     }
 
     #[test]

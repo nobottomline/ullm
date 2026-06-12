@@ -59,9 +59,13 @@ level, so invalid output is impossible — on any format, on CPU and GPU.
   free. On Qwen3-4B (vocab 151 669) the per-token grammar cost drops to a flat
   **~34 µs** (just applying the cached mask): ~3 200× over naive at structural
   states, ~9 200× inside an open string. `ullm grammar-bench <model>`
+- ☑ Schema `$ref` / `$defs` (+ `definitions`) including self-recursive schemas —
+  a `$ref` resolves to a grammar rule reserved before its target compiles, so a
+  tree-of-itself ties the knot instead of looping. Validated on Qwen3-4B with a
+  Pydantic-style nested-object schema (`jsonschema` confirms it conforms)
 - ☐ Streaming `tool_calls` deltas (tool calls are non-streamed today)
 - ☐ Regex-constrained decoding (a regex → NFA path); string `pattern`/`format`
-- ☐ Schema `$ref`/`$defs`, `additionalProperties` schema, `maxItems`
+- ☐ Schema `additionalProperties` schema, `maxItems`, `minLength`/`maxLength`
 
 ## Phase 2 — Serving & scale
 
