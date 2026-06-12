@@ -1,0 +1,3 @@
+# Force the answer to be exactly one sentiment label.
+#   ullm run <model> "Sentiment of 'I loved it'. Answer:" --grammar grammars/sentiment.gbnf
+root ::= "positive" | "negative" | "neutral"

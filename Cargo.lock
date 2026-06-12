@@ -852,6 +852,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ullm-grammar"
+version = "0.0.0"
+dependencies = [
+ "ullm-core",
+]
+
+[[package]]
 name = "ullm-metal"
 version = "0.0.0"
 dependencies = [
@@ -866,6 +873,7 @@ dependencies = [
  "rayon",
  "ullm-core",
  "ullm-gguf",
+ "ullm-grammar",
  "ullm-metal",
  "ullm-safetensors",
 ]

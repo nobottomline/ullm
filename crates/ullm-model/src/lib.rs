@@ -6,6 +6,7 @@
 //! numerical reference the Metal backend is validated against.
 
 mod config;
+mod constraint;
 mod math;
 mod mlx;
 mod sample;
@@ -17,7 +18,10 @@ use ullm_metal::{GpuExperts, GpuForward, GpuLayerInput, GpuModelInput, GpuParams
 use ullm_safetensors::SafeTensorsModel;
 
 pub use config::{Arch, LlamaConfig};
+pub use constraint::{GrammarConstraint, LogitConstraint};
 pub use sample::SampleParams;
+// Re-export the grammar types so callers build constraints without a direct dep.
+pub use ullm_grammar::Grammar;
 
 use math::{
     add_bias, dequant_mlx_row, gelu, matmul_q, matvec_q, rmsnorm, rope, rope_neox, silu, softmax,
@@ -854,13 +858,16 @@ impl LlamaModel {
 
     /// Generate tokens after `prompt`, invoking `on_token` for each new token.
     /// Stops at EOS, `max_new`, the context limit, or when `on_token` returns
-    /// `false`.
+    /// `false`. An optional [`LogitConstraint`] (e.g. a grammar) restricts every
+    /// sampled token to keep the *generated* output valid — the prompt is never
+    /// constrained, only the response.
     pub fn generate_stream<F: FnMut(u32) -> bool>(
         &mut self,
         prompt: &[u32],
         max_new: usize,
         eos: Option<u32>,
         params: &SampleParams,
+        mut constraint: Option<&mut dyn LogitConstraint>,
         mut on_token: F,
     ) {
         let mut pos = 0usize;
@@ -893,9 +900,15 @@ impl LlamaModel {
             if pos >= self.config.n_ctx || logits.is_empty() {
                 break;
             }
+            if let Some(c) = constraint.as_mut() {
+                c.constrain(&mut logits);
+            }
             let next = sample_token(&logits, params, &mut rng);
             if Some(next) == eos || !on_token(next) {
                 break;
+            }
+            if let Some(c) = constraint.as_mut() {
+                c.accept(next);
             }
             logits = self.forward(next, pos);
             pos += 1;
@@ -909,9 +922,10 @@ impl LlamaModel {
         max_new: usize,
         eos: Option<u32>,
         params: &SampleParams,
+        constraint: Option<&mut dyn LogitConstraint>,
     ) -> Vec<u32> {
         let mut out = Vec::new();
-        self.generate_stream(prompt, max_new, eos, params, |t| {
+        self.generate_stream(prompt, max_new, eos, params, constraint, |t| {
             out.push(t);
             true
         });

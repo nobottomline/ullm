@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/ullm-core",
     "crates/ullm-tokenizer",
+    "crates/ullm-grammar",
     "crates/ullm-gguf",
     "crates/ullm-safetensors",
     "crates/ullm-model",
@@ -25,6 +26,7 @@ homepage = "https://github.com/nobottomline/ullm"
 [workspace.dependencies]
 ullm-core = { path = "crates/ullm-core" }
 ullm-tokenizer = { path = "crates/ullm-tokenizer" }
+ullm-grammar = { path = "crates/ullm-grammar" }
 ullm-gguf = { path = "crates/ullm-gguf" }
 ullm-safetensors = { path = "crates/ullm-safetensors" }
 ullm-model = { path = "crates/ullm-model" }

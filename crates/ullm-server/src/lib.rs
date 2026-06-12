@@ -86,9 +86,13 @@ impl Engine {
         params: &SampleParams,
     ) -> (String, usize, usize) {
         let prompt_ids = self.tokenizer.encode(prompt, true);
-        let generated =
-            self.model
-                .generate(&prompt_ids, max_tokens, self.tokenizer.eos_id(), params);
+        let generated = self.model.generate(
+            &prompt_ids,
+            max_tokens,
+            self.tokenizer.eos_id(),
+            params,
+            None,
+        );
         let text = self.tokenizer.decode(&generated);
         (text, prompt_ids.len(), generated.len())
     }
@@ -107,7 +111,7 @@ impl Engine {
         let mut sent = self.tokenizer.decode(&prompt_ids).len();
         let tok = &self.tokenizer;
         self.model
-            .generate_stream(&prompt_ids, max_tokens, eos, params, |id| {
+            .generate_stream(&prompt_ids, max_tokens, eos, params, None, |id| {
                 all.push(id);
                 let full = tok.decode(&all);
                 if full.len() > sent {

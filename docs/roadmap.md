@@ -26,6 +26,20 @@ A clean, compiling Rust workspace and the skeletons everything else builds on.
 
 **Exit:** competitive single-Mac inference with best-in-class cold start.
 
+## Phase 1.5 — The differentiator: guaranteed structure
+
+The reason to choose uLLM (see [strategy/positioning.md](strategy/positioning.md)):
+a local model that *obeys a contract*. Decoding is constrained at the logit
+level, so invalid output is impossible — on any format, on CPU and GPU.
+
+- ☑ GBNF grammar engine (`ullm-grammar`) — byte-level pushdown NFA; parses
+  string/class/group/alternation/`*+?`; per-token logit masking. Validated
+  guaranteed-valid JSON + custom grammars on GGUF/HF/MLX (`--json`, `--grammar`)
+- ☐ JSON Schema → grammar compiler (typed keys, enums, required, min/maxItems)
+- ☐ `response_format` / `grammar` field in the OpenAI server + tool-call schemas
+- ☐ Token-trie acceleration for the mask (sub-ms constraint at full vocab)
+- ☐ Regex-constrained decoding (a regex → NFA path)
+
 ## Phase 2 — Serving & scale
 
 - ☐ Continuous batching + paged KV cache

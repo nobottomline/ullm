@@ -13,4 +13,5 @@ ullm-core = { workspace = true }
 ullm-gguf = { workspace = true }
 ullm-safetensors = { workspace = true }
 ullm-metal = { workspace = true }
+ullm-grammar = { workspace = true }
 rayon = { workspace = true }

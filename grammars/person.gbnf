@@ -1,0 +1,11 @@
+# A JSON object with EXACTLY the keys name, age, city (in that order) and typed
+# values. A schema-shaped grammar: the model can only fill the slots.
+#   ullm run <model> "Extract: John, 30, Paris." --grammar grammars/person.gbnf
+root   ::= "{" ws
+           "\"name\"" ws ":" ws string ws "," ws
+           "\"age\""  ws ":" ws number ws "," ws
+           "\"city\"" ws ":" ws string ws
+           "}"
+string ::= "\"" [^"\\]* "\""
+number ::= ("0" | [1-9] [0-9]*)
+ws     ::= [ \t\n\r]*

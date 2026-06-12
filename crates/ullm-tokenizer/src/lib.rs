@@ -160,4 +160,21 @@ impl Tokenizer {
             self.decode_spm(ids)
         }
     }
+
+    /// Raw bytes each token contributes to the output, indexed by id — the table
+    /// that drives grammar-constrained decoding. Control / special tokens, which
+    /// carry no literal text, get an empty piece (the grammar engine treats an
+    /// empty piece as "not a text token" and never allows it).
+    pub fn token_pieces(&self) -> Vec<Vec<u8>> {
+        let has_bpe = self.bpe.is_some();
+        (0..self.tokens.len() as u32)
+            .map(|id| {
+                if has_bpe {
+                    self.piece_bytes_bpe(id)
+                } else {
+                    self.piece_bytes_spm(id)
+                }
+            })
+            .collect()
+    }
 }

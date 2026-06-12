@@ -8,7 +8,7 @@ use ullm_core::device::Hardware;
 use ullm_core::ir::WeightSource;
 use ullm_gguf::GgufModel;
 use ullm_metal::MetalContext;
-use ullm_model::{LlamaModel, SampleParams};
+use ullm_model::{Grammar, GrammarConstraint, LlamaModel, SampleParams};
 use ullm_safetensors::SafeTensorsModel;
 
 #[derive(Parser)]
@@ -58,6 +58,12 @@ enum Command {
         /// Run the forward pass on the Metal GPU.
         #[arg(long)]
         gpu: bool,
+        /// Constrain output to a GBNF grammar file (guaranteed-valid structure).
+        #[arg(long, value_name = "FILE")]
+        grammar: Option<PathBuf>,
+        /// Constrain output to valid JSON (shorthand for the built-in grammar).
+        #[arg(long)]
+        json: bool,
     },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
@@ -108,6 +114,8 @@ fn main() {
             top_p,
             seed,
             gpu,
+            grammar,
+            json,
         } => run(
             &path,
             &prompt,
@@ -119,6 +127,8 @@ fn main() {
                 seed,
             },
             gpu,
+            grammar.as_deref(),
+            json,
         ),
         Command::Serve {
             path,
@@ -477,7 +487,16 @@ fn tokenize(path: &Path, text: &str) {
     println!("decoded:  {:?}", tk.decode(&ids));
 }
 
-fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams, gpu: bool) {
+#[allow(clippy::too_many_arguments)]
+fn run(
+    path: &Path,
+    prompt: &str,
+    max_tokens: usize,
+    params: SampleParams,
+    gpu: bool,
+    grammar_file: Option<&Path>,
+    json: bool,
+) {
     let exit = |e| -> ! {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -506,9 +525,31 @@ fn run(path: &Path, prompt: &str, max_tokens: usize, params: SampleParams, gpu: 
 
     let prompt_ids = tk.encode(prompt, true);
 
+    // Optional grammar constraint (guaranteed-valid structured output). The
+    // `grammar` binding must outlive `constraint`, which borrows it.
+    let grammar: Option<Grammar> = match (grammar_file, json) {
+        (Some(file), _) => {
+            let text = std::fs::read_to_string(file).unwrap_or_else(|e| exit(e.into()));
+            Some(Grammar::from_gbnf(&text).unwrap_or_else(|e| exit(e)))
+        }
+        (None, true) => Some(Grammar::json()),
+        (None, false) => None,
+    };
+    let mut constraint = grammar
+        .as_ref()
+        .map(|g| GrammarConstraint::new(g, tk.token_pieces(), tk.eos_id()));
+
     // Prefill (process the prompt) timed separately from decode.
     let t_gen = std::time::Instant::now();
-    let generated = lm.generate(&prompt_ids, max_tokens, tk.eos_id(), &params);
+    let generated = lm.generate(
+        &prompt_ids,
+        max_tokens,
+        tk.eos_id(),
+        &params,
+        constraint
+            .as_mut()
+            .map(|c| c as &mut dyn ullm_model::LogitConstraint),
+    );
     let gen_s = t_gen.elapsed().as_secs_f64();
 
     let mut full = prompt_ids.clone();

@@ -204,6 +204,25 @@ impl Tokenizer {
         }
         text
     }
+
+    /// Raw bytes a single SentencePiece token contributes (▁ -> space, byte
+    /// tokens kept verbatim). Empty for control / non-text tokens. Used to drive
+    /// grammar-constrained decoding.
+    pub(crate) fn piece_bytes_spm(&self, id: u32) -> Vec<u8> {
+        let i = id as usize;
+        if i >= self.tokens.len() {
+            return Vec::new();
+        }
+        match self.types[i] {
+            TokenType::Byte => self.id_to_byte[i].map(|b| vec![b]).unwrap_or_default(),
+            TokenType::Normal | TokenType::UserDefined => {
+                self.tokens[i].replace(SPACE, " ").into_bytes()
+            }
+            TokenType::Control | TokenType::Unknown | TokenType::Unused | TokenType::Undefined => {
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// A span of the normalized text in the merge linked-list.

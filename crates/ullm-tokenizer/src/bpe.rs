@@ -173,6 +173,26 @@ impl Tokenizer {
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    /// Raw bytes a single byte-level-BPE token contributes (no lossy UTF-8
+    /// conversion — byte-fallback tokens can be mid-codepoint). Empty for
+    /// control / non-text tokens. Used to drive grammar-constrained decoding.
+    pub(crate) fn piece_bytes_bpe(&self, id: u32) -> Vec<u8> {
+        let i = id as usize;
+        let bpe = self.bpe.as_ref().expect("bpe data");
+        if i >= self.tokens.len()
+            || matches!(
+                self.types[i],
+                TokenType::Control | TokenType::Unknown | TokenType::Unused | TokenType::Undefined
+            )
+        {
+            return Vec::new();
+        }
+        self.tokens[i]
+            .chars()
+            .filter_map(|ch| bpe.byte_decoder.get(&ch).copied())
+            .collect()
+    }
 }
 
 /// GPT-2's reversible byte -> printable-unicode-char mapping.
