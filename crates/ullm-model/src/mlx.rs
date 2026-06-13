@@ -209,6 +209,7 @@ impl LlamaModel {
                     moe_inter,
                     gs,
                 )?,
+                shared: None,
                 linear: None,
             });
         }

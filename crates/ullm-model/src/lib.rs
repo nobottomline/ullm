@@ -31,7 +31,7 @@ use math::{
     add_bias, dequant_mlx_row, gelu, matmul_q, matvec_q, rmsnorm, rope, rope_neox, silu, softmax,
 };
 use sample::{apply_no_repeat_ngram, apply_repetition_penalty, sample_token};
-use weights::{qweight, tensor_f32};
+use weights::{qweight, stacked_experts, tensor_f32};
 
 /// Side tables for an MLX 4-bit weight kept resident (group scale + bias),
 /// instead of pre-dequantizing it to a wider type.
@@ -86,6 +86,9 @@ struct LayerWeights {
     experts_gate: Vec<QWeight>,
     experts_up: Vec<QWeight>,
     experts_down: Vec<QWeight>,
+    /// Always-on shared expert (Qwen3-Next MoE): added to the routed experts,
+    /// scaled by `sigmoid(shared_gate · x)`.
+    shared: Option<SharedExpert>,
     /// Gated-DeltaNet (linear attention) block. When `Some`, this layer replaces
     /// softmax attention with the SSM recurrence (Qwen3.5 / Qwen3-Next hybrids)
     /// and the `wq`/`wk`/`wv`/`wo` fields above are unused placeholders.
@@ -106,21 +109,26 @@ struct FullAttn {
     k_norm: Option<Vec<f32>>,
 }
 
+/// An empty, never-read `QWeight` placeholder (for the dense fields a MoE layer
+/// doesn't use, or the attention fields a linear layer doesn't use).
+fn empty_qweight() -> QWeight {
+    QWeight {
+        data: Vec::new(),
+        dtype: DType::F32,
+        out: 0,
+        cols: 0,
+        mlx: None,
+    }
+}
+
 impl FullAttn {
     /// Unused placeholder for a linear-attention layer (its `wq..wo` are never read).
     fn placeholder() -> Self {
-        let empty = || QWeight {
-            data: Vec::new(),
-            dtype: DType::F32,
-            out: 0,
-            cols: 0,
-            mlx: None,
-        };
         Self {
-            wq: empty(),
-            wk: empty(),
-            wv: empty(),
-            wo: empty(),
+            wq: empty_qweight(),
+            wk: empty_qweight(),
+            wv: empty_qweight(),
+            wo: empty_qweight(),
             q_bias: None,
             k_bias: None,
             v_bias: None,
@@ -128,6 +136,27 @@ impl FullAttn {
             k_norm: None,
         }
     }
+}
+
+/// The feed-forward weights of a layer — dense SwiGLU or a sparse MoE.
+struct Ffn {
+    w_gate: QWeight,
+    w_up: QWeight,
+    w_down: QWeight,
+    moe_gate: Option<QWeight>,
+    experts_gate: Vec<QWeight>,
+    experts_up: Vec<QWeight>,
+    experts_down: Vec<QWeight>,
+    shared: Option<SharedExpert>,
+}
+
+/// Always-on shared expert of a Qwen3-Next MoE layer (a SwiGLU MLP plus a
+/// scalar gate applied to its output).
+struct SharedExpert {
+    gate: QWeight,
+    up: QWeight,
+    down: QWeight,
+    gate_logit: QWeight, // [1, hidden] -> one logit; sigmoid scales the output
 }
 
 /// Weights of a Gated-DeltaNet (linear attention) block. Projections are kept
@@ -263,6 +292,7 @@ impl LlamaModel {
                 experts_gate: Vec::new(),
                 experts_up: Vec::new(),
                 experts_down: Vec::new(),
+                shared: None,
                 linear: None,
             });
         }
@@ -316,10 +346,16 @@ impl LlamaModel {
                 arch_name.unwrap_or("?")
             ))
         })?;
-        if arch == Arch::Qwen3Moe {
+        // Hybrid linear/full models (Qwen3.5 / Qwen3-Next): linear-attention on
+        // most layers, output-gated full attention on the rest, and a sparse MoE
+        // FFN (routed experts + a shared expert) when `num_experts` is set.
+        let hybrid = tc.get("linear_num_value_heads").is_some();
+        let n_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let is_moe = n_experts > 0;
+        if is_moe && !hybrid {
             return Err(Error::Unsupported(
-                "mixture-of-experts from SafeTensors is not wired yet — run the MLX 4-bit \
-                 build of this model, or convert it to GGUF"
+                "non-hybrid mixture-of-experts from SafeTensors is not wired yet — run the \
+                 MLX 4-bit build of this model, or convert it to GGUF"
                     .into(),
             ));
         }
@@ -341,7 +377,8 @@ impl LlamaModel {
         let n_head = req("num_attention_heads")?;
         let n_layer = req("num_hidden_layers")?;
         let n_kv_head = cu("num_key_value_heads").unwrap_or(n_head);
-        let n_ff = req("intermediate_size")?;
+        // Dense FFN width; absent on pure-MoE models (they use moe_intermediate_size).
+        let n_ff = cu("intermediate_size").unwrap_or(0);
         let head_dim = cu("head_dim").unwrap_or(n_embd / n_head);
         let n_ctx = cu("max_position_embeddings").unwrap_or(8192).min(8192);
         // rope_theta may sit at the root or inside `rope_parameters` (transformers
@@ -367,9 +404,8 @@ impl LlamaModel {
         let rotary_dim = (head_dim as f32 * partial) as usize;
         let eps = cf("rms_norm_eps").unwrap_or(1e-6);
         let vocab_size = req("vocab_size")?;
-        // Hybrid linear/full models (Qwen3.5 / Qwen3-Next): linear-attention on
-        // most layers, and the full-attention layers are output-gated.
-        let hybrid = tc.get("linear_num_value_heads").is_some();
+        let n_experts_used = cu("num_experts_per_tok").unwrap_or(0);
+        let moe_inter = cu("moe_intermediate_size").unwrap_or(0);
 
         let config = LlamaConfig {
             arch,
@@ -385,9 +421,9 @@ impl LlamaModel {
             eps,
             rotary_dim,
             attn_gated: hybrid,
-            n_experts: 0,
-            n_experts_used: 0,
-            moe_inter: 0,
+            n_experts,
+            n_experts_used,
+            moe_inter,
             sliding_window: 0,
         };
 
@@ -452,9 +488,61 @@ impl LlamaModel {
                 model,
                 &format!("{p}.post_attention_layernorm.weight"),
             )?);
-            let w_gate = qweight(model, &format!("{p}.mlp.gate_proj.weight"))?;
-            let w_up = qweight(model, &format!("{p}.mlp.up_proj.weight"))?;
-            let w_down = qweight(model, &format!("{p}.mlp.down_proj.weight"))?;
+            // Feed-forward: dense SwiGLU, or a sparse MoE (routed experts split
+            // out of the stacked, gate/up-fused tensors, plus a shared expert).
+            let mp = format!("{p}.mlp");
+            let ffn = if is_moe {
+                Ffn {
+                    w_gate: empty_qweight(),
+                    w_up: empty_qweight(),
+                    w_down: empty_qweight(),
+                    moe_gate: Some(qweight(model, &format!("{mp}.gate.weight"))?),
+                    experts_gate: stacked_experts(
+                        model,
+                        &format!("{mp}.experts.gate_up_proj"),
+                        n_experts,
+                        2 * moe_inter,
+                        0,
+                        moe_inter,
+                        n_embd,
+                    )?,
+                    experts_up: stacked_experts(
+                        model,
+                        &format!("{mp}.experts.gate_up_proj"),
+                        n_experts,
+                        2 * moe_inter,
+                        moe_inter,
+                        moe_inter,
+                        n_embd,
+                    )?,
+                    experts_down: stacked_experts(
+                        model,
+                        &format!("{mp}.experts.down_proj"),
+                        n_experts,
+                        n_embd,
+                        0,
+                        n_embd,
+                        moe_inter,
+                    )?,
+                    shared: Some(SharedExpert {
+                        gate: qweight(model, &format!("{mp}.shared_expert.gate_proj.weight"))?,
+                        up: qweight(model, &format!("{mp}.shared_expert.up_proj.weight"))?,
+                        down: qweight(model, &format!("{mp}.shared_expert.down_proj.weight"))?,
+                        gate_logit: qweight(model, &format!("{mp}.shared_expert_gate.weight"))?,
+                    }),
+                }
+            } else {
+                Ffn {
+                    w_gate: qweight(model, &format!("{mp}.gate_proj.weight"))?,
+                    w_up: qweight(model, &format!("{mp}.up_proj.weight"))?,
+                    w_down: qweight(model, &format!("{mp}.down_proj.weight"))?,
+                    moe_gate: None,
+                    experts_gate: Vec::new(),
+                    experts_up: Vec::new(),
+                    experts_down: Vec::new(),
+                    shared: None,
+                }
+            };
 
             let (attn, linear, state) = if hybrid && is_linear(i) {
                 let d = ldims.unwrap();
@@ -510,13 +598,14 @@ impl LlamaModel {
                 post_attn_norm: None,
                 post_ffn_norm: None,
                 ffn_norm,
-                w_gate,
-                w_up,
-                w_down,
-                moe_gate: None,
-                experts_gate: Vec::new(),
-                experts_up: Vec::new(),
-                experts_down: Vec::new(),
+                w_gate: ffn.w_gate,
+                w_up: ffn.w_up,
+                w_down: ffn.w_down,
+                moe_gate: ffn.moe_gate,
+                experts_gate: ffn.experts_gate,
+                experts_up: ffn.experts_up,
+                experts_down: ffn.experts_down,
+                shared: ffn.shared,
                 linear,
             });
         }
@@ -1395,6 +1484,17 @@ fn moe_ffn(lw: &LayerWeights, gate_w: &QWeight, xb: &[f32], n_used: usize) -> Ve
         let wk = weights[k];
         for (o, d) in out.iter_mut().zip(&down) {
             *o += wk * d;
+        }
+    }
+    // Always-on shared expert (Qwen3-Next): a SwiGLU MLP scaled by a sigmoid gate.
+    if let Some(s) = &lw.shared {
+        let gate = matvec_q(&s.gate, xb);
+        let up = matvec_q(&s.up, xb);
+        let hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
+        let shared_out = matvec_q(&s.down, &hidden);
+        let g = 1.0 / (1.0 + (-matvec_q(&s.gate_logit, xb)[0]).exp());
+        for (o, d) in out.iter_mut().zip(&shared_out) {
+            *o += g * d;
         }
     }
     out
