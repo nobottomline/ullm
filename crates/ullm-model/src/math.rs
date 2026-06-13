@@ -113,12 +113,19 @@ pub(crate) fn add_bias(x: &mut [f32], b: &[f32]) {
 
 /// Rotary position embedding (interleaved / ggml "NORM" convention), applied to
 /// each head independently in place.
-pub(crate) fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
+pub(crate) fn rope(
+    vec: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    theta: f32,
+) {
     for h in 0..n_heads {
         let off = h * head_dim;
         let mut i = 0;
-        while i + 1 < head_dim {
-            let freq = theta.powf(i as f32 / head_dim as f32).recip();
+        while i + 1 < rotary_dim {
+            let freq = theta.powf(i as f32 / rotary_dim as f32).recip();
             let (sin, cos) = (pos as f32 * freq).sin_cos();
             let (a, b) = (vec[off + i], vec[off + i + 1]);
             vec[off + i] = a * cos - b * sin;
@@ -130,12 +137,21 @@ pub(crate) fn rope(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize,
 
 /// NeoX / "rotate-half" RoPE: rotates `(x[i], x[i+d/2])`. Used for Gemma and for
 /// HF/SafeTensors weights, which are not permuted into the interleaved layout.
-pub(crate) fn rope_neox(vec: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
-    let half = head_dim / 2;
+pub(crate) fn rope_neox(
+    vec: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    theta: f32,
+) {
+    // Only the first `rotary_dim` of each head is rotated (partial rotary, e.g.
+    // Qwen3.5); the rest pass through. `rotary_dim == head_dim` is full rotary.
+    let half = rotary_dim / 2;
     for h in 0..n_heads {
         let off = h * head_dim;
         for i in 0..half {
-            let freq = theta.powf(2.0 * i as f32 / head_dim as f32).recip();
+            let freq = theta.powf(2.0 * i as f32 / rotary_dim as f32).recip();
             let (sin, cos) = (pos as f32 * freq).sin_cos();
             let (a, b) = (vec[off + i], vec[off + i + half]);
             vec[off + i] = a * cos - b * sin;

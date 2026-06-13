@@ -61,6 +61,12 @@ pub struct LlamaConfig {
     pub n_head: usize,
     pub n_kv_head: usize,
     pub head_dim: usize,
+    /// Rotary dimensions of each head (== `head_dim` for full RoPE; smaller for
+    /// partial rotary, e.g. Qwen3.5 rotates only the first quarter).
+    pub rotary_dim: usize,
+    /// Output-gated attention (Qwen3-Next / Qwen3.5): `q_proj` emits twice the
+    /// query width — half query, half a gate that multiplies the attention output.
+    pub attn_gated: bool,
     pub n_ff: usize,
     pub vocab_size: usize,
     pub n_ctx: usize,

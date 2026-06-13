@@ -147,6 +147,8 @@ impl LlamaModel {
             n_head,
             n_kv_head,
             head_dim,
+            rotary_dim: head_dim,
+            attn_gated: false,
             n_ff: 0,
             vocab_size,
             n_ctx,
@@ -207,6 +209,7 @@ impl LlamaModel {
                     moe_inter,
                     gs,
                 )?,
+                linear: None,
             });
         }
 
@@ -222,6 +225,7 @@ impl LlamaModel {
             val_cache: cache,
             rope_neox: true,
             gpu: None,
+            linear_states: Vec::new(),
         })
     }
 }

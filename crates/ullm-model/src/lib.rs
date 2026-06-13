@@ -26,6 +26,7 @@ pub use sample::SampleParams;
 // Re-export the grammar types so callers build constraints without a direct dep.
 pub use ullm_grammar::{Grammar, GrammarDfa, GrammarState, TokenTrie};
 
+use deltanet::{DeltaNetDims, DeltaNetState, deltanet_step};
 use math::{
     add_bias, dequant_mlx_row, gelu, matmul_q, matvec_q, rmsnorm, rope, rope_neox, silu, softmax,
 };
@@ -85,6 +86,63 @@ struct LayerWeights {
     experts_gate: Vec<QWeight>,
     experts_up: Vec<QWeight>,
     experts_down: Vec<QWeight>,
+    /// Gated-DeltaNet (linear attention) block. When `Some`, this layer replaces
+    /// softmax attention with the SSM recurrence (Qwen3.5 / Qwen3-Next hybrids)
+    /// and the `wq`/`wk`/`wv`/`wo` fields above are unused placeholders.
+    linear: Option<LinearAttn>,
+}
+
+/// The softmax-attention projections of a layer, grouped so the loader can swap
+/// the whole block for a linear-attention one.
+struct FullAttn {
+    wq: QWeight,
+    wk: QWeight,
+    wv: QWeight,
+    wo: QWeight,
+    q_bias: Option<Vec<f32>>,
+    k_bias: Option<Vec<f32>>,
+    v_bias: Option<Vec<f32>>,
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
+}
+
+impl FullAttn {
+    /// Unused placeholder for a linear-attention layer (its `wq..wo` are never read).
+    fn placeholder() -> Self {
+        let empty = || QWeight {
+            data: Vec::new(),
+            dtype: DType::F32,
+            out: 0,
+            cols: 0,
+            mlx: None,
+        };
+        Self {
+            wq: empty(),
+            wk: empty(),
+            wv: empty(),
+            wo: empty(),
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
+            q_norm: None,
+            k_norm: None,
+        }
+    }
+}
+
+/// Weights of a Gated-DeltaNet (linear attention) block. Projections are kept
+/// quantized like the rest of the model; the small per-head tables stay f32.
+struct LinearAttn {
+    in_proj_qkv: QWeight,
+    in_proj_z: QWeight,
+    in_proj_b: QWeight,
+    in_proj_a: QWeight,
+    out_proj: QWeight,
+    conv1d: Vec<f32>,  // [conv_dim, conv_kernel]
+    a_log: Vec<f32>,   // [n_v_heads]
+    dt_bias: Vec<f32>, // [n_v_heads]
+    norm: Vec<f32>,    // [head_v]
+    dims: DeltaNetDims,
 }
 
 /// A loaded Llama model with its KV cache.
@@ -101,6 +159,10 @@ pub struct LlamaModel {
     rope_neox: bool,
     /// Optional resident GPU forward; when present, `forward` runs on the GPU.
     gpu: Option<GpuForward>,
+    /// Per-layer recurrent state for linear-attention (Gated-DeltaNet) layers —
+    /// `Some` only on those layers. Reset at sequence position 0. A non-empty
+    /// `Some` makes this a hybrid model (CPU-only for now).
+    linear_states: Vec<Option<DeltaNetState>>,
 }
 
 impl LlamaModel {
@@ -168,6 +230,8 @@ impl LlamaModel {
             n_ctx,
             rope_theta,
             eps,
+            rotary_dim: head_dim,
+            attn_gated: false,
             n_experts: 0,
             n_experts_used: 0,
             moe_inter: 0,
@@ -199,6 +263,7 @@ impl LlamaModel {
                 experts_gate: Vec::new(),
                 experts_up: Vec::new(),
                 experts_down: Vec::new(),
+                linear: None,
             });
         }
         let final_norm = tensor_f32(model, "output_norm.weight")?;
@@ -220,6 +285,7 @@ impl LlamaModel {
             // GGUF weights are not, so Gemma uses NeoX even from GGUF.
             rope_neox: arch == Arch::Gemma3,
             gpu: None,
+            linear_states: Vec::new(),
         })
     }
 
@@ -278,9 +344,32 @@ impl LlamaModel {
         let n_ff = req("intermediate_size")?;
         let head_dim = cu("head_dim").unwrap_or(n_embd / n_head);
         let n_ctx = cu("max_position_embeddings").unwrap_or(8192).min(8192);
-        let rope_theta = cf("rope_theta").unwrap_or(1_000_000.0);
+        // rope_theta may sit at the root or inside `rope_parameters` (transformers
+        // 5.x). Partial rotary (Qwen3.5) rotates only `head_dim * factor` of each
+        // head.
+        let rope_params = tc.get("rope_parameters");
+        let rope_theta = cf("rope_theta")
+            .or_else(|| {
+                rope_params
+                    .and_then(|v| v.get("rope_theta"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+            })
+            .unwrap_or(1_000_000.0);
+        let partial = cf("partial_rotary_factor")
+            .or_else(|| {
+                rope_params
+                    .and_then(|v| v.get("partial_rotary_factor"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+            })
+            .unwrap_or(1.0);
+        let rotary_dim = (head_dim as f32 * partial) as usize;
         let eps = cf("rms_norm_eps").unwrap_or(1e-6);
         let vocab_size = req("vocab_size")?;
+        // Hybrid linear/full models (Qwen3.5 / Qwen3-Next): linear-attention on
+        // most layers, and the full-attention layers are output-gated.
+        let hybrid = tc.get("linear_num_value_heads").is_some();
 
         let config = LlamaConfig {
             arch,
@@ -294,6 +383,8 @@ impl LlamaModel {
             n_ctx,
             rope_theta,
             eps,
+            rotary_dim,
+            attn_gated: hybrid,
             n_experts: 0,
             n_experts_used: 0,
             moe_inter: 0,
@@ -309,50 +400,127 @@ impl LlamaModel {
                 Error::Format("could not locate the decoder layers in the SafeTensors".into())
             })?;
 
-        // We run standard multi-head attention (q/k/v/o projections). Some recent
-        // models (e.g. Qwen3.5 "linear" / SSM hybrids) swap it for a linear_attn /
-        // Mamba block — fail with a clear message instead of a cryptic missing
-        // q_proj far into loading.
-        if !model.has_tensor(&format!("{prefix}layers.0.self_attn.q_proj.weight")) {
-            let kind = if model.has_tensor(&format!("{prefix}layers.0.linear_attn.A_log")) {
-                "linear (state-space / Mamba-style) attention"
+        // Per-layer Gated-DeltaNet geometry; `layer_types` (or
+        // `full_attention_interval`) decides which layers are linear.
+        let ldims = hybrid.then(|| DeltaNetDims {
+            hidden: n_embd,
+            n_v_heads: cu("linear_num_value_heads").unwrap_or(0),
+            n_k_heads: cu("linear_num_key_heads").unwrap_or(0),
+            head_k: cu("linear_key_head_dim").unwrap_or(0),
+            head_v: cu("linear_value_head_dim").unwrap_or(0),
+            conv_kernel: cu("linear_conv_kernel_dim").unwrap_or(4),
+            eps,
+        });
+        let layer_types = tc.get("layer_types").and_then(|v| v.as_array()).cloned();
+        let full_interval = cu("full_attention_interval");
+        let is_linear = |i: usize| -> bool {
+            if let Some(lt) = &layer_types {
+                lt.get(i).and_then(|v| v.as_str()) == Some("linear_attention")
             } else {
-                "an unsupported attention block (no self_attn.q_proj)"
-            };
-            return Err(Error::Unsupported(format!(
-                "this model uses {kind}, which uLLM does not run yet — only standard \
-                 multi-head attention is supported"
-            )));
+                full_interval.is_some_and(|fi| (i + 1) % fi != 0)
+            }
+        };
+
+        // Standard models must have q/k/v/o projections; fail clearly otherwise.
+        if !hybrid && !model.has_tensor(&format!("{prefix}layers.0.self_attn.q_proj.weight")) {
+            return Err(Error::Unsupported(
+                "this model has no standard self_attn.q_proj and is not a recognized \
+                 linear-attention hybrid — unsupported attention block"
+                    .into(),
+            ));
         }
+
+        // Qwen3-Next RMSNorm applies `(1 + weight)` (Gemma-style), unlike plain
+        // Qwen3. Fold the +1 into the regular norm weights at load so the shared
+        // plain RMSNorm is exact. The DeltaNet gated norm stays plain (it is
+        // `weight *`, not `(1+weight) *`), so it is NOT folded.
+        let plus1 = |mut v: Vec<f32>| -> Vec<f32> {
+            if hybrid {
+                v.iter_mut().for_each(|x| *x += 1.0);
+            }
+            v
+        };
 
         let tok_embeddings = qweight(model, &format!("{prefix}embed_tokens.weight"))?;
         let mut layers = Vec::with_capacity(n_layer);
+        let mut linear_states = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
             let p = format!("{prefix}layers.{i}");
+            // Norms and the (dense) FFN are common to both attention kinds.
+            let attn_norm = plus1(tensor_f32(model, &format!("{p}.input_layernorm.weight"))?);
+            let ffn_norm = plus1(tensor_f32(
+                model,
+                &format!("{p}.post_attention_layernorm.weight"),
+            )?);
+            let w_gate = qweight(model, &format!("{p}.mlp.gate_proj.weight"))?;
+            let w_up = qweight(model, &format!("{p}.mlp.up_proj.weight"))?;
+            let w_down = qweight(model, &format!("{p}.mlp.down_proj.weight"))?;
+
+            let (attn, linear, state) = if hybrid && is_linear(i) {
+                let d = ldims.unwrap();
+                let lp = format!("{p}.linear_attn");
+                let lin = LinearAttn {
+                    in_proj_qkv: qweight(model, &format!("{lp}.in_proj_qkv.weight"))?,
+                    in_proj_z: qweight(model, &format!("{lp}.in_proj_z.weight"))?,
+                    in_proj_b: qweight(model, &format!("{lp}.in_proj_b.weight"))?,
+                    in_proj_a: qweight(model, &format!("{lp}.in_proj_a.weight"))?,
+                    out_proj: qweight(model, &format!("{lp}.out_proj.weight"))?,
+                    conv1d: tensor_f32(model, &format!("{lp}.conv1d.weight"))?,
+                    a_log: tensor_f32(model, &format!("{lp}.A_log"))?,
+                    dt_bias: tensor_f32(model, &format!("{lp}.dt_bias"))?,
+                    norm: tensor_f32(model, &format!("{lp}.norm.weight"))?,
+                    dims: d,
+                };
+                (
+                    FullAttn::placeholder(),
+                    Some(lin),
+                    Some(DeltaNetState::new(&d)),
+                )
+            } else {
+                let sp = format!("{p}.self_attn");
+                let full = FullAttn {
+                    wq: qweight(model, &format!("{sp}.q_proj.weight"))?,
+                    wk: qweight(model, &format!("{sp}.k_proj.weight"))?,
+                    wv: qweight(model, &format!("{sp}.v_proj.weight"))?,
+                    wo: qweight(model, &format!("{sp}.o_proj.weight"))?,
+                    q_bias: tensor_f32(model, &format!("{sp}.q_proj.bias")).ok(),
+                    k_bias: tensor_f32(model, &format!("{sp}.k_proj.bias")).ok(),
+                    v_bias: tensor_f32(model, &format!("{sp}.v_proj.bias")).ok(),
+                    q_norm: tensor_f32(model, &format!("{sp}.q_norm.weight"))
+                        .ok()
+                        .map(&plus1),
+                    k_norm: tensor_f32(model, &format!("{sp}.k_norm.weight"))
+                        .ok()
+                        .map(&plus1),
+                };
+                (full, None, None)
+            };
+            linear_states.push(state);
             layers.push(LayerWeights {
-                attn_norm: tensor_f32(model, &format!("{p}.input_layernorm.weight"))?,
-                wq: qweight(model, &format!("{p}.self_attn.q_proj.weight"))?,
-                wk: qweight(model, &format!("{p}.self_attn.k_proj.weight"))?,
-                wv: qweight(model, &format!("{p}.self_attn.v_proj.weight"))?,
-                wo: qweight(model, &format!("{p}.self_attn.o_proj.weight"))?,
-                q_bias: tensor_f32(model, &format!("{p}.self_attn.q_proj.bias")).ok(),
-                k_bias: tensor_f32(model, &format!("{p}.self_attn.k_proj.bias")).ok(),
-                v_bias: tensor_f32(model, &format!("{p}.self_attn.v_proj.bias")).ok(),
-                q_norm: tensor_f32(model, &format!("{p}.self_attn.q_norm.weight")).ok(),
-                k_norm: tensor_f32(model, &format!("{p}.self_attn.k_norm.weight")).ok(),
+                attn_norm,
+                wq: attn.wq,
+                wk: attn.wk,
+                wv: attn.wv,
+                wo: attn.wo,
+                q_bias: attn.q_bias,
+                k_bias: attn.k_bias,
+                v_bias: attn.v_bias,
+                q_norm: attn.q_norm,
+                k_norm: attn.k_norm,
                 post_attn_norm: None,
                 post_ffn_norm: None,
-                ffn_norm: tensor_f32(model, &format!("{p}.post_attention_layernorm.weight"))?,
-                w_gate: qweight(model, &format!("{p}.mlp.gate_proj.weight"))?,
-                w_up: qweight(model, &format!("{p}.mlp.up_proj.weight"))?,
-                w_down: qweight(model, &format!("{p}.mlp.down_proj.weight"))?,
+                ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
                 moe_gate: None,
                 experts_gate: Vec::new(),
                 experts_up: Vec::new(),
                 experts_down: Vec::new(),
+                linear,
             });
         }
-        let final_norm = tensor_f32(model, &format!("{prefix}norm.weight"))?;
+        let final_norm = plus1(tensor_f32(model, &format!("{prefix}norm.weight"))?);
         // The output projection is `lm_head.weight` (at the root or under the
         // decoder prefix); tied to the input embeddings when absent.
         let output = qweight(model, "lm_head.weight")
@@ -373,6 +541,7 @@ impl LlamaModel {
             // HF weights are not permuted: use NeoX RoPE.
             rope_neox: true,
             gpu: None,
+            linear_states,
         })
     }
 
@@ -393,9 +562,22 @@ impl LlamaModel {
     /// Move the model's weights onto the GPU and route `forward` through the
     /// single-command-buffer Metal forward pass. Falls back to CPU if no GPU.
     pub fn enable_gpu(&mut self) -> Result<()> {
+        if self.is_hybrid() {
+            return Err(Error::Unsupported(
+                "linear-attention (Qwen3.5 / Qwen3-Next) models run on CPU only — the GPU \
+                 forward has no state-space path yet"
+                    .into(),
+            ));
+        }
         let gpu = self.build_gpu()?;
         self.gpu = Some(gpu);
         Ok(())
+    }
+
+    /// Whether this is a hybrid linear-attention model (CPU-only; any layer is a
+    /// Gated-DeltaNet block).
+    pub fn is_hybrid(&self) -> bool {
+        self.linear_states.iter().any(Option::is_some)
     }
 
     /// Whether the GPU forward path is active.
@@ -537,6 +719,7 @@ impl LlamaModel {
         let use_neox = self.rope_neox;
         let c = &self.config;
         let head_dim = c.head_dim;
+        let rotary_dim = c.rotary_dim;
         let kv_dim = c.n_kv_head * head_dim;
         let q_dim = c.n_head * head_dim;
         let kv_mul = c.n_head / c.n_kv_head;
@@ -548,80 +731,131 @@ impl LlamaModel {
         let rope_theta = c.rope_theta;
         let scale = (head_dim as f32).sqrt().recip();
 
+        // Reset the linear-attention recurrent state at the start of a sequence.
+        if pos == 0 {
+            for s in self.linear_states.iter_mut().flatten() {
+                s.reset();
+            }
+        }
+
         let mut x = self.embed(token);
 
         for l in 0..n_layer {
             let lw = &self.layers[l];
 
-            // --- attention ---
+            // --- attention: Gated-DeltaNet (linear) or standard softmax ---
             let xb = rmsnorm(&x, &lw.attn_norm, eps);
-            let mut q = matvec_q(&lw.wq, &xb);
-            let mut k = matvec_q(&lw.wk, &xb);
-            let mut v = matvec_q(&lw.wv, &xb);
-            if let Some(b) = &lw.q_bias {
-                add_bias(&mut q, b);
-            }
-            if let Some(b) = &lw.k_bias {
-                add_bias(&mut k, b);
-            }
-            if let Some(b) = &lw.v_bias {
-                add_bias(&mut v, b);
-            }
-
-            // Qwen3-style per-head Q/K RMSNorm, applied before RoPE.
-            if let Some(qn) = &lw.q_norm {
-                for h in 0..n_head {
-                    let s = h * head_dim;
-                    let normed = rmsnorm(&q[s..s + head_dim], qn, eps);
-                    q[s..s + head_dim].copy_from_slice(&normed);
-                }
-            }
-            if let Some(kn) = &lw.k_norm {
-                for h in 0..n_kv_head {
-                    let s = h * head_dim;
-                    let normed = rmsnorm(&k[s..s + head_dim], kn, eps);
-                    k[s..s + head_dim].copy_from_slice(&normed);
-                }
-            }
-
-            if use_neox {
-                rope_neox(&mut q, n_head, head_dim, pos, rope_theta);
-                rope_neox(&mut k, n_kv_head, head_dim, pos, rope_theta);
+            let attn = if let Some(lin) = &lw.linear {
+                let qkv = matvec_q(&lin.in_proj_qkv, &xb);
+                let zz = matvec_q(&lin.in_proj_z, &xb);
+                let bb = matvec_q(&lin.in_proj_b, &xb);
+                let aa = matvec_q(&lin.in_proj_a, &xb);
+                let state = self.linear_states[l].as_mut().expect("linear state");
+                let normed = deltanet_step(
+                    state,
+                    &qkv,
+                    &zz,
+                    &bb,
+                    &aa,
+                    &lin.conv1d,
+                    &lin.a_log,
+                    &lin.dt_bias,
+                    &lin.norm,
+                    lin.dims,
+                );
+                matvec_q(&lin.out_proj, &normed)
             } else {
-                rope(&mut q, n_head, head_dim, pos, rope_theta);
-                rope(&mut k, n_kv_head, head_dim, pos, rope_theta);
-            }
+                let mut q = matvec_q(&lw.wq, &xb);
+                // Qwen3-Next output-gated attention: q_proj emits [query | gate]
+                // per head. Split off the gate; it multiplies the attention output.
+                let gate = if c.attn_gated {
+                    let mut query = vec![0.0f32; q_dim];
+                    let mut gate = vec![0.0f32; q_dim];
+                    for h in 0..n_head {
+                        let src = h * head_dim * 2;
+                        let dst = h * head_dim;
+                        query[dst..dst + head_dim].copy_from_slice(&q[src..src + head_dim]);
+                        gate[dst..dst + head_dim]
+                            .copy_from_slice(&q[src + head_dim..src + 2 * head_dim]);
+                    }
+                    q = query;
+                    Some(gate)
+                } else {
+                    None
+                };
+                let mut k = matvec_q(&lw.wk, &xb);
+                let mut v = matvec_q(&lw.wv, &xb);
+                if let Some(b) = &lw.q_bias {
+                    add_bias(&mut q, b);
+                }
+                if let Some(b) = &lw.k_bias {
+                    add_bias(&mut k, b);
+                }
+                if let Some(b) = &lw.v_bias {
+                    add_bias(&mut v, b);
+                }
 
-            let kv_base = l * n_ctx * kv_dim;
-            let off = kv_base + pos * kv_dim;
-            self.key_cache[off..off + kv_dim].copy_from_slice(&k);
-            self.val_cache[off..off + kv_dim].copy_from_slice(&v);
-
-            let mut att_out = vec![0.0f32; q_dim];
-            for h in 0..n_head {
-                let kvh = h / kv_mul;
-                let qh = &q[h * head_dim..h * head_dim + head_dim];
-
-                let mut scores: Vec<f32> = (0..=pos)
-                    .map(|t| {
-                        let ko = kv_base + t * kv_dim + kvh * head_dim;
-                        let kt = &self.key_cache[ko..ko + head_dim];
-                        qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale
-                    })
-                    .collect();
-                softmax(&mut scores);
-
-                let oo = h * head_dim;
-                for (t, &a) in scores.iter().enumerate() {
-                    let vo = kv_base + t * kv_dim + kvh * head_dim;
-                    let vt = &self.val_cache[vo..vo + head_dim];
-                    for (dst, &vv) in att_out[oo..oo + head_dim].iter_mut().zip(vt) {
-                        *dst += a * vv;
+                // Qwen3-style per-head Q/K RMSNorm, applied before RoPE.
+                if let Some(qn) = &lw.q_norm {
+                    for h in 0..n_head {
+                        let s = h * head_dim;
+                        let normed = rmsnorm(&q[s..s + head_dim], qn, eps);
+                        q[s..s + head_dim].copy_from_slice(&normed);
                     }
                 }
-            }
+                if let Some(kn) = &lw.k_norm {
+                    for h in 0..n_kv_head {
+                        let s = h * head_dim;
+                        let normed = rmsnorm(&k[s..s + head_dim], kn, eps);
+                        k[s..s + head_dim].copy_from_slice(&normed);
+                    }
+                }
 
-            let attn = matvec_q(&lw.wo, &att_out);
+                if use_neox {
+                    rope_neox(&mut q, n_head, head_dim, rotary_dim, pos, rope_theta);
+                    rope_neox(&mut k, n_kv_head, head_dim, rotary_dim, pos, rope_theta);
+                } else {
+                    rope(&mut q, n_head, head_dim, rotary_dim, pos, rope_theta);
+                    rope(&mut k, n_kv_head, head_dim, rotary_dim, pos, rope_theta);
+                }
+
+                let kv_base = l * n_ctx * kv_dim;
+                let off = kv_base + pos * kv_dim;
+                self.key_cache[off..off + kv_dim].copy_from_slice(&k);
+                self.val_cache[off..off + kv_dim].copy_from_slice(&v);
+
+                let mut att_out = vec![0.0f32; q_dim];
+                for h in 0..n_head {
+                    let kvh = h / kv_mul;
+                    let qh = &q[h * head_dim..h * head_dim + head_dim];
+
+                    let mut scores: Vec<f32> = (0..=pos)
+                        .map(|t| {
+                            let ko = kv_base + t * kv_dim + kvh * head_dim;
+                            let kt = &self.key_cache[ko..ko + head_dim];
+                            qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale
+                        })
+                        .collect();
+                    softmax(&mut scores);
+
+                    let oo = h * head_dim;
+                    for (t, &a) in scores.iter().enumerate() {
+                        let vo = kv_base + t * kv_dim + kvh * head_dim;
+                        let vt = &self.val_cache[vo..vo + head_dim];
+                        for (dst, &vv) in att_out[oo..oo + head_dim].iter_mut().zip(vt) {
+                            *dst += a * vv;
+                        }
+                    }
+                }
+
+                // Apply the attention output gate (Qwen3-Next), if any.
+                if let Some(gate) = &gate {
+                    for (a, g) in att_out.iter_mut().zip(gate) {
+                        *a *= 1.0 / (1.0 + (-g).exp());
+                    }
+                }
+                matvec_q(&lw.wo, &att_out)
+            };
             for (xi, ai) in x.iter_mut().zip(&attn) {
                 *xi += ai;
             }
@@ -659,6 +893,7 @@ impl LlamaModel {
         let use_neox = self.rope_neox;
         let c = &self.config;
         let head_dim = c.head_dim;
+        let rotary_dim = c.rotary_dim;
         let kv_dim = c.n_kv_head * head_dim;
         let q_dim = c.n_head * head_dim;
         let kv_mul = c.n_head / c.n_kv_head;
@@ -723,11 +958,11 @@ impl LlamaModel {
                     }
                 }
                 if use_neox {
-                    rope_neox(qs, n_head, head_dim, pos, rope_theta);
-                    rope_neox(ks, n_kv_head, head_dim, pos, rope_theta);
+                    rope_neox(qs, n_head, head_dim, rotary_dim, pos, rope_theta);
+                    rope_neox(ks, n_kv_head, head_dim, rotary_dim, pos, rope_theta);
                 } else {
-                    rope(qs, n_head, head_dim, pos, rope_theta);
-                    rope(ks, n_kv_head, head_dim, pos, rope_theta);
+                    rope(qs, n_head, head_dim, rotary_dim, pos, rope_theta);
+                    rope(ks, n_kv_head, head_dim, rotary_dim, pos, rope_theta);
                 }
                 let off = l * n_ctx * kv_dim + pos * kv_dim;
                 self.key_cache[off..off + kv_dim].copy_from_slice(ks);
@@ -803,6 +1038,7 @@ impl LlamaModel {
     fn forward_gemma(&mut self, token: u32, pos: usize) -> Vec<f32> {
         let c = &self.config;
         let head_dim = c.head_dim;
+        let rotary_dim = c.rotary_dim;
         let kv_dim = c.n_kv_head * head_dim;
         let q_dim = c.n_head * head_dim;
         let kv_mul = c.n_head / c.n_kv_head;
@@ -844,8 +1080,8 @@ impl LlamaModel {
             }
 
             // Gemma GGUF weights are not permuted: use NeoX (rotate-half) RoPE.
-            rope_neox(&mut q, n_head, head_dim, pos, rope_theta);
-            rope_neox(&mut k, n_kv_head, head_dim, pos, rope_theta);
+            rope_neox(&mut q, n_head, head_dim, rotary_dim, pos, rope_theta);
+            rope_neox(&mut k, n_kv_head, head_dim, rotary_dim, pos, rope_theta);
 
             let kv_base = l * n_ctx * kv_dim;
             let off = kv_base + pos * kv_dim;
@@ -952,7 +1188,7 @@ impl LlamaModel {
                 } else {
                     false
                 }
-            } else if self.config.arch != Arch::Gemma3 {
+            } else if self.config.arch != Arch::Gemma3 && !self.is_hybrid() {
                 logits = self.forward_batch(&prompt[..take], 0);
                 pos = take;
                 true

@@ -673,7 +673,14 @@ fn load_model(path: &Path, gpu: bool) -> (ullm_tokenizer::Tokenizer, LlamaModel,
         (tk, lm, template)
     };
     if gpu {
-        lm.enable_gpu().unwrap_or_else(|e| die(e));
+        if lm.is_hybrid() {
+            eprintln!(
+                "note: this is a linear-attention model (Qwen3.5 / Qwen3-Next); \
+                 running on CPU — the GPU path has no state-space kernel yet"
+            );
+        } else {
+            lm.enable_gpu().unwrap_or_else(|e| die(e));
+        }
     }
     (tk, lm, template)
 }
