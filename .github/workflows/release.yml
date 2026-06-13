@@ -51,7 +51,7 @@ jobs:
           URL="https://github.com/nobottomline/ullm/releases/download/${GITHUB_REF_NAME}/${TARBALL}"
           git clone "https://x-access-token:${GH_TOKEN}@github.com/nobottomline/homebrew-ullm.git" tap
           F=tap/Formula/ullm.rb
-          sed -i '' -E "s|^  version \".*\"|  version \"${VERSION}\"|" "$F"
+          # Homebrew scans the version from the URL, so only url + sha need bumping.
           sed -i '' -E "s|^  url \".*\"|  url \"${URL}\"|" "$F"
           sed -i '' -E "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" "$F"
           cd tap

@@ -14,8 +14,16 @@ use ullm_model::{
 use ullm_safetensors::SafeTensorsModel;
 
 #[derive(Parser)]
-#[command(name = "ullm", version, about = "Universal LLM inference engine")]
+#[command(
+    name = "ullm",
+    version,
+    about = "Universal LLM inference engine",
+    disable_version_flag = true
+)]
 struct Cli {
+    /// Print the version and exit (also `-V`, `--version`).
+    #[arg(short = 'v', short_alias = 'V', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
     #[command(subcommand)]
     command: Command,
 }
