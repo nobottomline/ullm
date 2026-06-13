@@ -32,7 +32,7 @@ with torch.no_grad():
     for p in mod.parameters():
         p.copy_(torch.randn_like(p) * 0.2)
 
-seq = 6
+seq = 100  # > chunk_size (64) so the reference exercises cross-chunk recurrence
 x = torch.randn(1, seq, cfg.hidden_size, dtype=torch.float32) * 0.5
 with torch.no_grad():
     y = mod(x)

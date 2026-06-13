@@ -30,7 +30,7 @@ use deltanet::{DeltaNetDims, DeltaNetState, deltanet_step};
 use math::{
     add_bias, dequant_mlx_row, gelu, matmul_q, matvec_q, rmsnorm, rope, rope_neox, silu, softmax,
 };
-use sample::{apply_repetition_penalty, sample_token};
+use sample::{apply_no_repeat_ngram, apply_repetition_penalty, sample_token};
 use weights::{qweight, tensor_f32};
 
 /// Side tables for an MLX 4-bit weight kept resident (group scale + bias),
@@ -1214,6 +1214,11 @@ impl LlamaModel {
             }
             let start = history.len().saturating_sub(params.repeat_last_n);
             apply_repetition_penalty(&mut logits, &history[start..], params.repeat_penalty);
+            // Block verbatim n-gram loops — but not under a grammar constraint,
+            // where banning a token could leave no valid continuation.
+            if constraint.is_none() {
+                apply_no_repeat_ngram(&mut logits, &history, params.no_repeat_ngram);
+            }
             if let Some(c) = constraint.as_mut() {
                 c.constrain(&mut logits);
             }

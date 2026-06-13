@@ -18,6 +18,9 @@ pub struct SampleParams {
     pub repeat_penalty: f32,
     /// How many recent tokens the repetition penalty looks back over.
     pub repeat_last_n: usize,
+    /// Forbid repeating any `n`-gram already produced (`0` disables). A hard stop
+    /// against verbatim loops, applied only when no grammar constraint is active.
+    pub no_repeat_ngram: usize,
 }
 
 impl Default for SampleParams {
@@ -29,6 +32,24 @@ impl Default for SampleParams {
             seed: 0,
             repeat_penalty: 1.1,
             repeat_last_n: 64,
+            no_repeat_ngram: 0,
+        }
+    }
+}
+
+/// Block any token that would complete an `n`-gram already present in `history`
+/// — a hard guarantee against verbatim loops (cf. transformers' no_repeat_ngram).
+pub(crate) fn apply_no_repeat_ngram(logits: &mut [f32], history: &[u32], n: usize) {
+    if n < 2 || history.len() < n {
+        return;
+    }
+    let suffix = &history[history.len() - (n - 1)..];
+    for i in 0..=history.len() - n {
+        if &history[i..i + n - 1] == suffix {
+            let banned = history[i + n - 1] as usize;
+            if banned < logits.len() {
+                logits[banned] = f32::NEG_INFINITY;
+            }
         }
     }
 }
