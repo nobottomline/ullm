@@ -30,6 +30,15 @@ impl Arch {
         let mt = model_type.unwrap_or("").to_ascii_lowercase();
         let an = architectures.unwrap_or("").to_ascii_lowercase();
         let is = |needle: &str| mt.contains(needle) || an.contains(needle);
+        // Non-text-generation modalities share a base family name (e.g.
+        // `qwen3_tts`) — reject them up front so they get a clear "unsupported"
+        // message instead of being mistaken for a text LLM.
+        if ["tts", "audio", "whisper", "m2m", "ocr", "yolo"]
+            .iter()
+            .any(|m| is(m))
+        {
+            return None;
+        }
         // Mixture-of-experts variants share the base family name, so test first.
         if is("qwen3") && is("moe") {
             return Some(Arch::Qwen3Moe);
@@ -109,8 +118,11 @@ mod tests {
             Arch::detect(None, Some("Qwen3ForCausalLM")),
             Some(Arch::Qwen3)
         );
-        // Unrecognized families return None (caller emits a clear error).
+        // Unrecognized families and non-text modalities return None (the caller
+        // emits a clear "unsupported" error).
         assert_eq!(mt("whisper"), None);
         assert_eq!(mt("m2m_100"), None);
+        assert_eq!(mt("qwen3_tts"), None); // audio, despite containing "qwen3"
+        assert_eq!(mt("glm_ocr_text"), None);
     }
 }
