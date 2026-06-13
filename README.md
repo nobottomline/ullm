@@ -23,16 +23,18 @@ Apple-Silicon-first, embeddable.
 Apple Silicon Mac (macOS 14+):
 
 ```sh
-# Prebuilt binary — grab the latest release tarball, unpack, run:
+# Homebrew (recommended) — prebuilt binary, no Rust needed:
+brew install nobottomline/ullm/ullm
+#   or:  brew tap nobottomline/ullm && brew install ullm
+
+# ...or grab the release tarball directly:
 #   https://github.com/nobottomline/ullm/releases/latest
 tar -xzf ullm-*-aarch64-apple-darwin.tar.gz && ./ullm-*/ullm doctor
 
 # ...or from source (needs Rust):
-cargo build --release      # binary at ./target/release/ullm
-# or: cargo install --path crates/ullm-cli
+cargo install --git https://github.com/nobottomline/ullm ullm-cli
+#   or, in a clone:  cargo build --release   # binary at ./target/release/ullm
 ```
-
-Homebrew (`brew install nobottomline/ullm/ullm`) is on the way.
 
 ## Quickstart
 

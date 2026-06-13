@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "ullm-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "rayon",
@@ -840,11 +840,11 @@ dependencies = [
 
 [[package]]
 name = "ullm-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ullm-gguf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memmap2",
  "ullm-core",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "ullm-grammar"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "ullm-core",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "ullm-metal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "metal",
  "ullm-core",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "ullm-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "serde_json",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "ullm-safetensors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memmap2",
  "serde_json",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "ullm-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "serde",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "ullm-tokenizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fancy-regex",
  "serde_json",

@@ -10,6 +10,9 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    # `secrets.*` can't be used directly in `if:`, so surface presence as a bool.
+    env:
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,3 +36,26 @@ jobs:
           files: |
             ullm-*-aarch64-apple-darwin.tar.gz
             ullm-*-aarch64-apple-darwin.tar.gz.sha256
+
+      # Bump the Homebrew tap formula to this release. Needs a PAT secret
+      # `HOMEBREW_TAP_TOKEN` with write access to nobottomline/homebrew-ullm;
+      # without it this step is skipped (update the formula by hand).
+      - name: Update Homebrew tap
+        if: env.HAS_TAP_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARBALL="ullm-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+          SHA=$(cut -d' ' -f1 "${TARBALL}.sha256")
+          URL="https://github.com/nobottomline/ullm/releases/download/${GITHUB_REF_NAME}/${TARBALL}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/nobottomline/homebrew-ullm.git" tap
+          F=tap/Formula/ullm.rb
+          sed -i '' -E "s|^  version \".*\"|  version \"${VERSION}\"|" "$F"
+          sed -i '' -E "s|^  url \".*\"|  url \"${URL}\"|" "$F"
+          sed -i '' -E "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" "$F"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "ullm ${VERSION}"
+          git push
